@@ -15,11 +15,15 @@ Provider facts (probed 2026-09-28):
     pay-as-you-go gateway (``.../v1``) lists MiMo but needs its own key.
     Point ``MIMO_BASE_URL`` there if that key is the one that gets created.
 
-Key handling: ``MIMO_API_KEY`` env if set, else the 0600 key file
-``MIMO_KEY_FILE`` (default ``~/.mimo_key``) read **per turn** — the chat
-container bind-mounts the operator home, so dropping the key on the host
-takes effect on the next turn with no container recreate. Until a key exists
-the turn ends with a clear "not configured" error instead of a blank reply.
+Endpoint resolution, **per turn** (the chat container bind-mounts the
+operator home, so a key dropped on the host takes effect on the next turn):
+  1. ``MIMO_API_KEY`` env / ``MIMO_KEY_FILE`` (default ``~/.mimo_key``)
+     against ``MIMO_BASE_URL`` (default Xiaomi direct) — explicit MiMo key.
+  2. else the TokenHub key (``tokenhub_runner.resolve_key``) against the
+     TokenHub plan endpoint — TokenHub lists ``mimo-v2.6-pro``, so this works
+     the moment the key's model scope includes MiMo in the TokenHub console.
+     A 403002 from TokenHub is surfaced with that exact hint.
+  3. else a clear "not configured" error instead of a blank reply.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import haihub_runner
+import tokenhub_runner
 
 MIMO_BASE_URL = os.environ.get(
     "MIMO_BASE_URL", "https://api.xiaomimimo.com/v1"
@@ -49,8 +54,17 @@ _MIMO_MODELS: dict[str, str] = {
 _MIMO_MAX_TOKENS = 65536
 
 NOT_CONFIGURED_MESSAGE = (
-    "MiMo V2.6 Pro is not configured yet: no MIMO_API_KEY / ~/.mimo_key on the "
-    "host. Pick another model or ask the operator to add the key."
+    "MiMo V2.6 Pro is not configured yet: no MIMO_API_KEY / ~/.mimo_key and no "
+    "TokenHub key on the host. Pick another model or ask the operator to add a key."
+)
+
+# Appended when TokenHub answers 403 for a MiMo model: the key exists but its
+# model scope (TokenHub console -> API Key management) excludes MiMo.
+TOKENHUB_SCOPE_HINT = (
+    "The TokenHub key is not scoped for mimo-v2.6-pro. Fix: in the TokenHub "
+    "console (API Key management) widen the key's model scope to include MiMo, "
+    "or put a MiMo-scoped key in ~/.mimo_key (set MIMO_BASE_URL if it is a "
+    "TokenHub pay-as-you-go key)."
 )
 
 
@@ -60,7 +74,7 @@ def is_mimo_model(model: str | None) -> bool:
 
 
 def resolve_key() -> str | None:
-    """API key from ``MIMO_API_KEY`` env, else the key file. Per call."""
+    """Explicit MiMo key from ``MIMO_API_KEY`` env, else the key file. Per call."""
     key = os.environ.get("MIMO_API_KEY", "").strip()
     if key:
         return key
@@ -68,6 +82,19 @@ def resolve_key() -> str | None:
         return _MIMO_KEY_FILE.read_text(encoding="utf-8").strip() or None
     except OSError:
         return None
+
+
+def resolve_endpoint() -> tuple[str, str, str] | None:
+    """``(base_url, api_key, source)`` for this turn, or None when no key
+    exists anywhere. ``source`` is ``"mimo"`` (explicit key) or
+    ``"tokenhub"`` (fallback onto the TokenHub plan key)."""
+    key = resolve_key()
+    if key:
+        return MIMO_BASE_URL, key, "mimo"
+    th_key = tokenhub_runner.resolve_key()
+    if th_key:
+        return tokenhub_runner.TOKENHUB_BASE_URL, th_key, "tokenhub"
+    return None
 
 
 async def run_turn(
@@ -80,17 +107,24 @@ async def run_turn(
     OpenAI-style ``reasoning_effort`` (app.py validates it first; MiMo has no
     served levels yet, so it arrives as None).
     """
-    key = resolve_key()
-    if not key:
+    endpoint = resolve_endpoint()
+    if endpoint is None:
         yield {"type": "error", "message": NOT_CONFIGURED_MESSAGE}
         return
+    base_url, key, source = endpoint
     async for ev in haihub_runner.run_turn(
         model=model,
-        base_url=MIMO_BASE_URL,
+        base_url=base_url,
         api_key=key,
         models_map=_MIMO_MODELS,
         max_tokens=_MIMO_MAX_TOKENS,
         effort=effort,
         **kwargs,
     ):
+        if (
+            source == "tokenhub"
+            and ev.get("type") == "error"
+            and "HTTP 403" in str(ev.get("message", ""))
+        ):
+            ev = {**ev, "message": f"{ev['message']} — {TOKENHUB_SCOPE_HINT}"}
         yield ev

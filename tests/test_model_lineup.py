@@ -58,3 +58,24 @@ def test_mimo_turn_without_key_fails_closed(monkeypatch):
         emergency=False, provider="mimo",
     ))
     assert "not configured" in text
+
+
+def test_mimo_endpoint_falls_back_to_tokenhub(monkeypatch, tmp_path):
+    """No MiMo key but a TokenHub key -> the turn goes to TokenHub's endpoint
+    with that key (TokenHub lists mimo-v2.6-pro; only the key scope gates it)."""
+    monkeypatch.delenv("MIMO_API_KEY", raising=False)
+    monkeypatch.delenv("TOKENHUB_API_KEY", raising=False)
+    monkeypatch.setattr(bot, "_MIMO_KEY_FILE", tmp_path / "absent")
+    (tmp_path / "glm").write_text("sk-tp-plan\n")
+    monkeypatch.setattr(bot, "_TOKENHUB_KEY_FILE", tmp_path / "glm")
+    assert bot._resolve_mimo_endpoint() == (bot._TOKENHUB_BASE_URL, "sk-tp-plan")
+    prov = bot._OPENAI_PROVIDERS["mimo"]
+    assert prov["key"]() == "sk-tp-plan"
+    assert prov["base_url"]() == bot._TOKENHUB_BASE_URL
+    # explicit MiMo key wins
+    monkeypatch.setenv("MIMO_API_KEY", "xiaomi-key")
+    assert bot._resolve_mimo_endpoint() == (bot._MIMO_BASE_URL, "xiaomi-key")
+    # neither -> (None, None) and the loop fails closed
+    monkeypatch.delenv("MIMO_API_KEY")
+    monkeypatch.setattr(bot, "_TOKENHUB_KEY_FILE", tmp_path / "absent2")
+    assert bot._resolve_mimo_endpoint() == (None, None)

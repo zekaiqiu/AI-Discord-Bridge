@@ -522,6 +522,20 @@ def _resolve_mimo_key() -> str | None:
         return None
 
 
+def _resolve_mimo_endpoint() -> tuple[str | None, str | None]:
+    """``(base_url, key)`` for a MiMo turn: the explicit MiMo key against
+    MIMO_BASE_URL if present, else the TokenHub plan key against the TokenHub
+    endpoint (TokenHub lists mimo-v2.6-pro; works once the key's model scope
+    includes MiMo in the TokenHub console). ``(None, None)`` when no key."""
+    key = _resolve_mimo_key()
+    if key:
+        return _MIMO_BASE_URL, key
+    th_key = _resolve_tokenhub_key()
+    if th_key:
+        return _TOKENHUB_BASE_URL, th_key
+    return None, None
+
+
 def _resolve_tokenhub_key() -> str | None:
     """TokenHub API key: TOKENHUB_API_KEY env, else the 0600 key file
     (~/.glm_key). Read per turn so a rotated key needs no restart."""
@@ -547,9 +561,10 @@ _OPENAI_PROVIDERS: dict[str, dict] = {
         "missing": "no TokenHub key (TOKENHUB_API_KEY or ~/.glm_key)",
     },
     "mimo": {
-        "base_url": _MIMO_BASE_URL,
-        "key": _resolve_mimo_key,
-        "missing": "no MiMo key (MIMO_API_KEY or ~/.mimo_key) — MiMo V2.6 Pro is not configured yet",
+        # base_url is a callable: it depends on which key resolves this turn.
+        "base_url": lambda: _resolve_mimo_endpoint()[0],
+        "key": lambda: _resolve_mimo_endpoint()[1],
+        "missing": "no MiMo key (MIMO_API_KEY or ~/.mimo_key) and no TokenHub key — MiMo V2.6 Pro is not configured yet",
     },
 }
 _QWEN_MAX_TOKENS = 8192
@@ -772,6 +787,7 @@ async def _run_haihub(
     key = prov["key"]()
     if not key:
         return (f"[{provider} provider unavailable: {prov['missing']}]", route)
+    base_url = prov["base_url"]() if callable(prov["base_url"]) else prov["base_url"]
 
     messages: list[dict] = [
         {"role": "system", "content": _haihub_system_prompt(label, emergency=emergency)},
@@ -804,7 +820,7 @@ async def _run_haihub(
                 reasoning_parts: list[str] = []
                 tool_calls, content, error = await _qwen_stream_step(
                     client, key, payload, sink, text_parts,
-                    base_url=prov["base_url"], provider=provider,
+                    base_url=base_url, provider=provider,
                     reasoning_parts=reasoning_parts,
                 )
                 if error is not None:

@@ -43,6 +43,23 @@ import prompt_blocks
 
 logger = logging.getLogger("chat.haihub_runner")
 
+def _provider_error_suffix(body: str) -> str:
+    """": <provider message>" from an OpenAI-style error body, else "".
+    Keeps the user-facing error actionable (TokenHub 403002 says which model
+    the key is not scoped for) without echoing an arbitrary 300-char body."""
+    try:
+        err = json.loads(body).get("error")
+    except Exception:
+        return ""
+    if isinstance(err, dict):
+        msg = str(err.get("message") or "").strip()
+    elif isinstance(err, str):
+        msg = err.strip()
+    else:
+        msg = ""
+    return f": {msg[:200]}" if msg else ""
+
+
 HAIHUB_BASE_URL = os.environ.get(
     "HAIHUB_BASE_URL", "https://api.model.haihub.cn/v1"
 ).rstrip("/")
@@ -377,7 +394,8 @@ async def _stream_step(
             if resp.status_code != 200:
                 body = (await resp.aread()).decode("utf-8", "replace")[:300]
                 logger.warning("haihub HTTP %s: %s", resp.status_code, body)
-                yield {"type": "_error", "message": f"haihub HTTP {resp.status_code}"}
+                yield {"type": "_error",
+                       "message": f"haihub HTTP {resp.status_code}{_provider_error_suffix(body)}"}
                 return
             # Split on "\n" ourselves: httpx's aiter_lines() uses str.splitlines(),
             # which also breaks on U+2028/U+2029/U+0085 — characters JSON does
