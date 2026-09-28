@@ -23,6 +23,7 @@ import json
 import logging
 import mimetypes
 import os
+import urllib.parse
 import re
 import tarfile
 import time
@@ -397,7 +398,14 @@ import re as _re  # noqa: E402
 #   - reasonable length cap
 # A second canonical-path startswith check at the route level is the
 # defence-in-depth backstop in case this regex misses something.
-_GENERATED_FILENAME_RE = _re.compile(r"^(?!\.)[a-zA-Z0-9._-]{1,80}$")
+# Any single path component the model may have used as a file name: no
+# separators, no leading dot (hidden/`..`), no control characters, bounded
+# length. Non-ASCII (Chinese titles), spaces and punctuation are all fine —
+# the serve route still resolves the path and checks it stays inside the
+# per-session dir. Links are percent-encoded by _scan_new_artifacts; the
+# route sees the decoded name. (Was ASCII-only, which 404'd every artifact
+# with a non-ASCII or spaced name even though the file was on disk.)
+_GENERATED_FILENAME_RE = _re.compile(r"^(?!\.)[^/\\\x00-\x1f\x7f]{1,200}$")
 _GENERATED_MEDIA_TYPES: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -1422,7 +1430,10 @@ def _scan_new_artifacts(
             "filename": p.name,
             "ext": ext,
             "size": size,
-            "url": f"/api/sessions/{session_id}/generated/{p.name}",
+            "url": (
+                f"/api/sessions/{session_id}/generated/"
+                + urllib.parse.quote(p.name, safe="")
+            ),
         })
     return out
 
