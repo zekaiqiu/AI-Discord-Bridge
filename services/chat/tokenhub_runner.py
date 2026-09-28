@@ -39,7 +39,11 @@ _TOKENHUB_MODELS: dict[str, str] = {
 
 # TokenHub accepts (and serves) larger completions than the haihub default;
 # long report-style chat turns with high effort need the headroom.
-_TOKENHUB_MAX_TOKENS = 16384
+# TokenHub accepts up to 131072 for glm-5.3 / kimi-k3 (probed 2026-09-28).
+# 16384 was too small: at effort=max the hidden reasoning alone could eat it
+# and the visible reply came back empty (finish_reason=length). This is a
+# ceiling, not a target — the model stops when it is done.
+_TOKENHUB_MAX_TOKENS = 65536
 
 
 def is_tokenhub_model(model: str | None) -> bool:

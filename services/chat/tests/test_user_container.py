@@ -951,3 +951,17 @@ def test_refresh_streams_on_switch_with_unknown_map_state(monkeypatch):
     )
     user_container.refresh_credentials_if_stale("c2", "account-2")
     assert streamed == [("c2", "account-3")]
+
+
+def test_provisioning_survives_auth_proxy_failure(exec_recorder, monkeypatch):
+    """The auth proxy only serves the claude-CLI path; with the pool dead it
+    cannot start. That must not abort provisioning (2026-09-28: every new
+    user got no container and all their turns failed closed)."""
+    import user_container as uc
+
+    def _boom(name):
+        raise RuntimeError("auth proxy did not come up within 5s")
+
+    monkeypatch.setattr(uc, "ensure_auth_proxy_running", _boom)
+    client = _make_client(container_present=False)
+    assert ensure_user_container(EMAIL, client=client) == EXPECTED_NAME

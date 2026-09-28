@@ -62,6 +62,21 @@ _MAX_TOKENS = 8192
 # (model call) and _TOOL_TIMEOUT (run_bash), so a turn can't hang indefinitely.
 _TOOL_TIMEOUT = 90           # seconds per run_bash command (enforced in-container)
 _MAX_STEPS = 40              # tool round-trips per turn before we stop the loop
+# Effort level used for the one retry after a step ends with
+# finish_reason="length" and NO visible text: the model spent the whole output
+# budget on hidden reasoning. "low" is accepted by every lineup model.
+_RETRY_EFFORT = "low"
+_LENGTH_RETRY_NUDGE = (
+    "Your previous attempt ran out of output budget before writing a reply "
+    "(the reasoning consumed it all). Answer the user now, directly and "
+    "concisely, without further tool calls."
+)
+_NO_REPLY_NOTICE = (
+    "[The model produced no visible reply: its reasoning used the entire "
+    "output budget twice (finish_reason=length). Try again with a lower "
+    "effort level or a narrower question.]"
+)
+_TRUNCATED_NOTICE = "[reply truncated: the model hit its output limit]"
 _MAX_TOOL_OUTPUT = 16000     # chars of tool output fed back to the model
 
 # Generous read timeout: thinking models lag before first token.
@@ -318,6 +333,7 @@ async def _stream_step(
     stripper = _ThinkStripper()
     content_parts: list[str] = []
     tool_acc: dict[int, dict[str, Any]] = {}
+    finish_reason: str | None = None
     # OpenAI-compatible usage object from the final pre-[DONE] chunk, when
     # the server honours stream_options.include_usage. None if absent.
     usage: dict[str, Any] | None = None
@@ -350,6 +366,8 @@ async def _stream_step(
                 choices = obj.get("choices") or []
                 if not choices:
                     continue
+                if choices[0].get("finish_reason"):
+                    finish_reason = str(choices[0]["finish_reason"])
                 delta = choices[0].get("delta") or {}
                 ctext = delta.get("content")
                 if ctext:
@@ -382,6 +400,7 @@ async def _stream_step(
         "tool_calls": tool_calls,
         "content": "".join(content_parts),
         "usage": usage,
+        "finish_reason": finish_reason,
     }
 
 
@@ -473,6 +492,7 @@ async def run_turn(
     # wipe the reply ("No reply — this turn produced no text").
     step_texts: list[str] = []
     final_text = ""
+    length_retried = False
     turn_start = time.monotonic()
     # Accumulate usage across tool round-trips so the reported total covers
     # the whole turn (each step bills its own tokens). None entries when the
@@ -547,7 +567,63 @@ async def run_turn(
 
                 tool_calls = meta["tool_calls"]
                 step_content = meta["content"]
+                finish = meta.get("finish_reason")
+
+                if finish == "length" and not tool_calls and not step_content.strip():
+                    # The whole output budget went to hidden reasoning: the
+                    # user would get a blank bubble. Retry once at low effort
+                    # with an explicit nudge; if that also comes back empty,
+                    # say so instead of persisting nothing.
+                    if not length_retried:
+                        length_retried = True
+                        logger.warning(
+                            "haihub: %s returned no text (finish_reason=length, "
+                            "%s completion tokens); retrying at effort=%s",
+                            display, (step_usage or {}).get("completion_tokens"),
+                            _RETRY_EFFORT,
+                        )
+                        payload["reasoning_effort"] = _RETRY_EFFORT
+                        payload["messages"] = messages + [
+                            {"role": "system", "content": _LENGTH_RETRY_NUDGE},
+                        ]
+                        payload.pop("tools", None)
+                        payload.pop("tool_choice", None)
+                        meta = None
+                        step_started = False
+                        async for ev in _stream_step(client, payload, base_url=base, api_key=key):
+                            t = ev["type"]
+                            if t == "delta":
+                                if not step_started:
+                                    step_started = True
+                                    if step_texts:
+                                        yield {"type": "delta", "text": "\n\n"}
+                                yield ev
+                            elif t == "_error":
+                                yield {"type": "error", "message": ev["message"]}
+                                return
+                            elif t == "_meta":
+                                meta = ev
+                        if meta is None:
+                            yield {"type": "error", "message": "haihub: empty response stream"}
+                            return
+                        retry_usage = meta.get("usage")
+                        if isinstance(retry_usage, dict):
+                            acc_prompt += int(retry_usage.get("prompt_tokens") or 0)
+                            acc_completion += int(retry_usage.get("completion_tokens") or 0)
+                        step_content = meta["content"]
+                        finish = meta.get("finish_reason")
+                        tool_calls = []
+                    if not step_content.strip():
+                        if step_texts:
+                            yield {"type": "delta", "text": "\n\n"}
+                        yield {"type": "delta", "text": _NO_REPLY_NOTICE}
+                        step_texts.append(_NO_REPLY_NOTICE)
+                        break
+
                 if step_content:
+                    if finish == "length":
+                        yield {"type": "delta", "text": "\n\n" + _TRUNCATED_NOTICE}
+                        step_content = step_content.rstrip() + "\n\n" + _TRUNCATED_NOTICE
                     step_texts.append(step_content)
 
                 if not tool_calls:

@@ -1551,7 +1551,18 @@ def _provision_container(
     # auth/rate-limit failure) can't persist as a sticky "Not logged in":
     # the next provision restores a well-formed credential.
     _write_workspace_dummy_credentials(name, account)
-    ensure_auth_proxy_running(name)
+    # The auth proxy only serves the claude-CLI path. It cannot start when the
+    # pooled account it fronts has no usable token (dead pool, 2026-09-28) —
+    # that must NOT abort provisioning, or a new user gets no container at
+    # all and every turn (including the API-model ones that need no proxy)
+    # fails closed. Log and carry on; the claude path reports its own error.
+    try:
+        ensure_auth_proxy_running(name)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "auth proxy not up in %s (claude-CLI turns will fail until an "
+            "account is available; API-model turns unaffected): %s", name, exc,
+        )
 
 
 def ensure_user_container(email: str, client=None) -> str:
