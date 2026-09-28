@@ -80,14 +80,21 @@ def test_single_step_reply_unchanged(monkeypatch):
     assert "".join(e["text"] for e in events if e["type"] == "delta") == "plain answer"
 
 
-def test_tool_loop_is_capped(monkeypatch):
+def test_tool_loop_cap_asks_for_a_final_answer(monkeypatch):
     monkeypatch.setattr(haihub_runner, "_MAX_STEPS", 3)
-    _script(monkeypatch, [{"chunks": [f"step {i}"], "tool_calls": TOOL} for i in range(10)])
+    steps = [{"chunks": [f"step {i}"], "tool_calls": TOOL} for i in range(3)]
+    steps.append({"chunks": ["Final summary of what I found."]})  # the no-tools wrap-up call
+    payloads = _script_with_payloads(monkeypatch, steps)
     events = _collect()
     done = [e for e in events if e["type"] == "done"][0]
     assert [e["type"] for e in events].count("tool_start") == 3
-    assert done["full_text"].endswith("[stopped after 3 tool steps without a final answer]")
-    assert done["full_text"].startswith("step 0\n\nstep 1\n\nstep 2")
+    assert done["full_text"].startswith("step 0\n\nstep 1\n\nstep 2\n\nFinal summary of what I found.")
+    assert "tool-call limit reached after 3 calls" in done["full_text"]
+    wrap = payloads[-1]
+    assert "tools" not in wrap and wrap["messages"][-1]["role"] == "system"
+    assert "Do not call any more tools" in wrap["messages"][-1]["content"]
+    streamed = "".join(e["text"] for e in events if e["type"] == "delta")
+    assert streamed == done["full_text"]
 
 
 # ---------------------------------------------------------------------------

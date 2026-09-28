@@ -61,7 +61,17 @@ _MAX_TOKENS = 8192
 # returns a tool-free answer. Each step is still bounded by _REQUEST_TIMEOUT
 # (model call) and _TOOL_TIMEOUT (run_bash), so a turn can't hang indefinitely.
 _TOOL_TIMEOUT = 90           # seconds per run_bash command (enforced in-container)
-_MAX_STEPS = 40              # tool round-trips per turn before we stop the loop
+# Tool round-trips per turn. This is a runaway guard, not a work budget: a
+# real research task (scrape a site, fetch fifty pages) legitimately needs
+# well over 40. When it is reached the model gets one final no-tools call to
+# answer with what it has, rather than the turn just stopping.
+_MAX_STEPS = 150
+_CAP_NUDGE = (
+    "You have used the maximum number of tool calls allowed in one turn. "
+    "Do not call any more tools. Give the user your final answer now from "
+    "the work already completed, and state clearly what (if anything) is "
+    "still unfinished so they can ask you to continue in a follow-up."
+)
 # Effort level used for the one retry after a step ends with
 # finish_reason="length" and NO visible text: the model spent the whole output
 # budget on hidden reasoning. "low" is accepted by every lineup model.
@@ -556,9 +566,44 @@ async def run_turn(
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
             for _step in itertools.count():
                 if _step >= _MAX_STEPS:
+                    # Budget exhausted: one last call with tools removed so
+                    # the user gets an answer from the completed work.
+                    cap_payload: dict[str, Any] = {
+                        "model": display,
+                        "stream": True,
+                        "max_tokens": max_tokens or _MAX_TOKENS,
+                        "messages": messages + [{"role": "system", "content": _CAP_NUDGE}],
+                        "stream_options": {"include_usage": True},
+                    }
+                    if effort:
+                        cap_payload["reasoning_effort"] = effort
+                    meta = None
+                    step_started = False
+                    async for ev in _stream_step(client, cap_payload, base_url=base, api_key=key):
+                        t = ev["type"]
+                        if t == "delta":
+                            if not step_started:
+                                step_started = True
+                                if step_texts:
+                                    yield {"type": "delta", "text": "\n\n"}
+                            yield ev
+                        elif t == "_error":
+                            yield {"type": "error", "message": ev["message"]}
+                            return
+                        elif t == "_meta":
+                            meta = ev
+                    if meta is not None:
+                        cap_usage = meta.get("usage")
+                        if isinstance(cap_usage, dict):
+                            saw_usage = True
+                            acc_prompt += int(cap_usage.get("prompt_tokens") or 0)
+                            acc_completion += int(cap_usage.get("completion_tokens") or 0)
+                        if meta["content"].strip():
+                            step_texts.append(meta["content"])
                     cap_note = (
-                        f"[stopped after {_MAX_STEPS} tool steps without a "
-                        "final answer]"
+                        f"[tool-call limit reached after {_MAX_STEPS} calls — "
+                        "answered from the work completed so far; ask to continue "
+                        "for the rest]"
                     )
                     if step_texts:
                         yield {"type": "delta", "text": "\n\n"}
