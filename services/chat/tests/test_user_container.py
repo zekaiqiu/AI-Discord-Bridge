@@ -71,7 +71,7 @@ class _ExecRecorder:
             self._stat_returncode = 0
             self._stat_stdout = f"{mtime:.0f}\n".encode()
 
-    def fake_run(self, argv, *, input=None, capture_output=True, check=True):
+    def fake_run(self, argv, *, input=None, capture_output=True, check=True, timeout=None):
         self.calls.append({"argv": list(argv), "stdin": input})
         # If the command is `stat -c %Y <path>`, answer with our canned reply.
         is_stat = any(a == "stat" for a in argv) and "-c" in argv

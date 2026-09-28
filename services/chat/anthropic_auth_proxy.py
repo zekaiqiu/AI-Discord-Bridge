@@ -125,16 +125,31 @@ class TokenCache:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._token: str | None = None
+        self._mtime_ns: int | None = None
+
+    @staticmethod
+    def _cred_mtime() -> int | None:
+        try:
+            return os.stat(CRED_PATH).st_mtime_ns
+        except OSError:
+            return None
 
     async def get(self, *, force_reread: bool = False) -> str:
-        if self._token is not None and not force_reread:
+        # The chat backend rewrites the file when it swaps the served account
+        # (saturation, refresh). A 401 is not the only signal: re-read
+        # whenever the file changed, or the OLD account's bearer keeps being
+        # sent and its 429s get blamed on the new account.
+        mtime = self._cred_mtime()
+        if self._token is not None and not force_reread and mtime == self._mtime_ns:
             return self._token
         async with self._lock:
-            if self._token is not None and not force_reread:
+            mtime = self._cred_mtime()
+            if self._token is not None and not force_reread and mtime == self._mtime_ns:
                 return self._token
             # Off-loop: tiny file, but avoids blocking the event loop on
             # disk I/O if /var/claude-runner ever lands on slow storage.
             self._token = await asyncio.to_thread(_read_cred_token)
+            self._mtime_ns = mtime
             return self._token
 
 

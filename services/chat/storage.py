@@ -77,7 +77,7 @@ _VALID_ASSISTANT_STATUSES = frozenset({
 
 def _is_valid_session_id(session_id: Any) -> bool:
     """True iff ``session_id`` is a UUID-shaped string safe to use in a path."""
-    return isinstance(session_id, str) and bool(_VALID_SESSION_ID.match(session_id))
+    return isinstance(session_id, str) and bool(_VALID_SESSION_ID.fullmatch(session_id))
 
 
 def _now_dt() -> datetime:
@@ -124,8 +124,62 @@ def _sessions_root() -> str:
     return os.environ.get("CHAT_SESSIONS_DIR", "/data/sessions")
 
 
+_OWNER_FILENAME = "_owner"
+
+
+def _normalize_email(email: str) -> str:
+    return email.strip().lower() if isinstance(email, str) else email
+
+
+def _read_owner(user_dir: str) -> str | None:
+    """The email a user dir belongs to: the ``_owner`` marker, else inferred
+    from the first session file in it (legacy dirs pre-date the marker)."""
+    try:
+        with open(os.path.join(user_dir, _OWNER_FILENAME), "r", encoding="utf-8") as fh:
+            owner = fh.read().strip()
+        if owner:
+            return owner
+    except OSError:
+        pass
+    try:
+        entries = os.listdir(user_dir)
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.endswith(".json") or entry.startswith("_"):
+            continue
+        data = _read_session_file(os.path.join(user_dir, entry))
+        if isinstance(data, dict) and isinstance(data.get("email"), str) and data["email"]:
+            return _normalize_email(data["email"])
+    return None
+
+
 def _user_dir(email: str) -> str:
-    return os.path.join(_sessions_root(), email_slug(email))
+    """Per-user directory. ``email_slug`` is not injective (``a+b@x`` and
+    ``a_b@x`` both become ``a_b_x``), and settings/memory live in the dir with
+    no owner check — so the dir records its owner and a second email that
+    maps to an owned dir gets its own hash-suffixed one instead of sharing
+    another user's memory and persona."""
+    root = _sessions_root()
+    email = _normalize_email(email)
+    slug = email_slug(email)
+    plain = os.path.join(root, slug)
+    if not os.path.isdir(plain):
+        return plain
+    owner = _read_owner(plain)
+    if owner is None:
+        owner = email
+    if owner == email:
+        marker = os.path.join(plain, _OWNER_FILENAME)
+        if not os.path.exists(marker):
+            try:
+                with open(marker, "w", encoding="utf-8") as fh:
+                    fh.write(email + "\n")
+            except OSError:
+                pass
+        return plain
+    import hashlib
+    return os.path.join(root, f"{slug}-{hashlib.sha1(email.encode('utf-8')).hexdigest()[:10]}")
 
 
 def _ensure_dir(path: str) -> None:
@@ -261,6 +315,38 @@ MEMORY_FILENAME = "_memory.md"
 MAX_MEMORY_BYTES = 8000  # capped so it can't dominate the context window
 
 
+def _truncate_bytes(text: str, limit: int) -> str:
+    """Cap by UTF-8 bytes (what the context window actually pays for), not
+    characters — 8000 CJK characters are 24 kB."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return raw[:limit].decode("utf-8", "ignore")
+
+
+def set_memory_merged(email: str, new_text: str, base_text: str | None) -> str:
+    """Persist a model-proposed memory rewrite without clobbering an update
+    another concurrent turn (multi-window tiling) made in the meantime.
+
+    ``base_text`` is what this turn read at its start. If the on-disk blob
+    is still that, write ``new_text`` as-is. Otherwise keep ``new_text`` and
+    append the lines the other turn added since ``base_text`` that the model
+    did not carry over (a line-level three-way merge)."""
+    current = get_memory(email)
+    if base_text is None or current == base_text or current == new_text:
+        return set_memory(email, new_text)
+    base_lines = set((base_text or "").splitlines())
+    new_lines = set(new_text.splitlines())
+    added_elsewhere = [
+        ln for ln in current.splitlines()
+        if ln.strip() and ln not in base_lines and ln not in new_lines
+    ]
+    merged = new_text.rstrip()
+    if added_elsewhere:
+        merged = merged + ("\n" if merged else "") + "\n".join(added_elsewhere)
+    return set_memory(email, merged)
+
+
 def _memory_path(email: str) -> str:
     return os.path.join(_user_dir(email), MEMORY_FILENAME)
 
@@ -273,7 +359,7 @@ def get_memory(email: str) -> str:
             data = fh.read()
     except (FileNotFoundError, OSError):
         return ""
-    return data[:MAX_MEMORY_BYTES]
+    return _truncate_bytes(data, MAX_MEMORY_BYTES)
 
 
 def set_memory(email: str, text: str) -> str:
@@ -282,7 +368,7 @@ def set_memory(email: str, text: str) -> str:
     dropped silently. Pass "" to clear."""
     if not isinstance(text, str):
         text = ""
-    truncated = text[:MAX_MEMORY_BYTES]
+    truncated = _truncate_bytes(text, MAX_MEMORY_BYTES)
     path = _memory_path(email)
     parent = os.path.dirname(path)
     _ensure_dir(parent)
@@ -782,6 +868,7 @@ def fork_session_seed(
         account=account or src.get("account"),
         role=role or src.get("role"),
         container=container or src.get("container"),
+        workspace=src.get("workspace"),
         folder=src.get("folder"),
         forked_from={"session_id": src_session_id, "from_seq": from_seq},
         seed_messages=keep,
@@ -914,8 +1001,11 @@ def append_user_message(
     *,
     ts: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    turn: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, int | None]:
     """Persist a user message immediately and return ``(session, seq)``.
+    ``turn`` (mode/model/effort the client chose) is recorded so a restart
+    recovery can re-run the turn the way it was asked for.
 
     Called by ``app.post_message`` BEFORE the SSE response is constructed,
     so the user's prompt is durable even if the client disconnects before
@@ -948,6 +1038,8 @@ def append_user_message(
     }
     if attachments:
         msg["attachments"] = attachments
+    if isinstance(turn, dict) and turn:
+        msg["turn"] = {k: v for k, v in turn.items() if v is not None}
     msgs.append(msg)
     _bump_updated_at(data)
     _atomic_write_json(_session_path(email, session_id), data)
@@ -1169,12 +1261,17 @@ def find_streaming_placeholders() -> list[dict[str, Any]]:
                     continue
                 prev = msgs[i - 1] if i > 0 and isinstance(msgs[i - 1], dict) else None
                 user_text = prev.get("content") if prev and prev.get("role") == "user" else None
+                turn = prev.get("turn") if prev and isinstance(prev.get("turn"), dict) else {}
                 recoverable = bool(
                     i == len(msgs) - 1
                     and isinstance(user_text, str) and user_text.strip()
                     and not m.get("via")
+                    # An image turn re-run as chat would be wrong (and re-bill
+                    # the image API); write it off instead.
+                    and (turn or {}).get("mode") != "image"
                 )
                 out.append({
+                    "turn": turn or {},
                     "email": data.get("email") or "",
                     "session_id": data.get("id") or entry[:-5],
                     "seq": m.get("seq"),

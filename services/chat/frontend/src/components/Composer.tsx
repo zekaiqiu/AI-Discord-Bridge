@@ -543,6 +543,10 @@ export function Composer(props: ComposerProps): JSX.Element {
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      // IME composition (pinyin, kana…): the Enter that commits a candidate
+      // must not send the half-composed text. Chrome flags isComposing,
+      // Safari delivers keyCode 229.
+      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
       // Picker handles its own keys when open: ↑↓ navigate, Enter accept,
       // Escape close, Tab also accepts (file-explorer style).
       if (pickerOpen && pickerResults.length > 0) {

@@ -43,6 +43,8 @@ if TYPE_CHECKING:  # avoid runtime import of fastapi from a "pure" module
 # ---------------------------------------------------------------------------
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
+# Total bytes pending in one session dir across requests (purged at turn end).
+MAX_SESSION_BYTES = 200 * 1024 * 1024
 MAX_FILES_PER_TURN = 5
 ALLOWED_MIME_PREFIXES: tuple[str, ...] = ("image/", "text/", "audio/", "video/")
 # Document/spreadsheet formats commonly attached in chat. Claude's Read
@@ -267,10 +269,17 @@ def _ext_allowed(filename: str) -> bool:
 
 
 def _next_filename(target_dir: Path, filename: str) -> str:
-    """Return ``filename`` if free, otherwise ``<unix-millis>_filename``."""
+    """Return ``filename`` if free, otherwise a ``<unix-millis>[-n]_filename``
+    that is verified free (two same-named files in one request used to land
+    on the same millisecond stamp and overwrite each other)."""
     if not (target_dir / filename).exists():
         return filename
-    return f"{int(time.time() * 1000)}_{filename}"
+    stamp = int(time.time() * 1000)
+    for n in range(1000):
+        candidate = f"{stamp}_{filename}" if n == 0 else f"{stamp}-{n}_{filename}"
+        if not (target_dir / candidate).exists():
+            return candidate
+    raise AttachmentError("could not allocate a unique file name", status_code=500)
 
 
 async def save_uploads(
@@ -297,6 +306,12 @@ async def save_uploads(
 
     target_dir = session_attachments_dir(session_id)
     target_dir.mkdir(parents=True, mode=_DIR_MODE, exist_ok=True)
+    # Per-session cap across requests: uploads only purge at turn end, so
+    # without this a signed-in user could fill the volume without ever
+    # sending a message.
+    existing_bytes = sum(
+        p.stat().st_size for p in target_dir.iterdir() if p.is_file()
+    )
 
     saved: list[dict[str, Any]] = []
     for upload in files:
@@ -319,18 +334,24 @@ async def save_uploads(
                 if not chunk:
                     break
                 size += len(chunk)
-                if size > MAX_FILE_BYTES:
+                if size > MAX_FILE_BYTES or existing_bytes + size > MAX_SESSION_BYTES:
                     out.close()
                     try:
                         final_path.unlink()
                     except FileNotFoundError:
                         pass
+                    if size > MAX_FILE_BYTES:
+                        raise AttachmentError(
+                            f"file too large (max {MAX_FILE_BYTES} bytes)",
+                            status_code=413,
+                        )
                     raise AttachmentError(
-                        f"file too large (max {MAX_FILE_BYTES} bytes)",
+                        f"too much pending upload data for this session (max {MAX_SESSION_BYTES} bytes)",
                         status_code=413,
                     )
                 out.write(chunk)
         os.chmod(final_path, _FILE_MODE)
+        existing_bytes += size
         # Reset the upload stream so the same UploadFile can be re-read by
         # later code (e.g. tests that inspect bytes); cheap and tidy.
         try:

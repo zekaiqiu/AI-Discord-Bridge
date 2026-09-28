@@ -454,7 +454,18 @@ def pick(*, min_headroom_pct: float = 20.0) -> AccountChoice:
     if snapshot_unavailable and len(snapshot_unavailable) == len(candidates):
         for name, home_path in snapshot_unavailable:
             creds_path = home_path / ".claude" / ".credentials.json"
-            if creds_path.is_file():
+            if not creds_path.is_file():
+                continue
+            # "Readable token" must mean a token that can still work: the
+            # expired account-2 was picked on every fail-open for days.
+            try:
+                with open(creds_path, "r", encoding="utf-8") as fh:
+                    _exp = (json.load(fh).get("claudeAiOauth") or {}).get("expiresAt")
+                if isinstance(_exp, (int, float)) and _exp / 1000.0 <= time.time():
+                    continue
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if True:
                 log.warning(
                     "router fail-open: %s — no usage data for any account, "
                     "routing to first candidate with a readable token",

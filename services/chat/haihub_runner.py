@@ -80,7 +80,10 @@ _TRUNCATED_NOTICE = "[reply truncated: the model hit its output limit]"
 _MAX_TOOL_OUTPUT = 16000     # chars of tool output fed back to the model
 
 # Generous read timeout: thinking models lag before first token.
-_REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
+# read= is a silence detector between streamed chunks, not a turn budget. 600s:
+# a max-effort reasoning step can stay quiet for minutes before its first
+# visible token on providers that don't stream reasoning deltas.
+_REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
 
 _SYSTEM_PROMPT = (
     "You are a helpful AI assistant in the Wizerith chat. "
@@ -167,6 +170,10 @@ class _ThinkStripper:
     def __init__(self) -> None:
         self._inside = False
         self._carry = ""
+        # Text seen since the last <think>: discarded when the tag closes,
+        # returned verbatim by flush() if it never does (the model was
+        # quoting the tag, not reasoning).
+        self._hidden = ""
 
     def feed(self, chunk: str) -> str:
         self._carry += chunk
@@ -183,21 +190,30 @@ class _ThinkStripper:
                 out.append(self._carry[:idx])
                 self._carry = self._carry[idx + len(_THINK_OPEN):]
                 self._inside = True
+                self._hidden = ""
             else:
                 idx = self._carry.find(_THINK_CLOSE)
                 if idx == -1:
                     keep = len(_THINK_CLOSE) - 1
-                    self._carry = self._carry[-keep:] if len(self._carry) > keep else self._carry
+                    if len(self._carry) > keep:
+                        self._hidden += self._carry[:-keep]
+                        self._carry = self._carry[-keep:]
                     break
                 self._carry = self._carry[idx + len(_THINK_CLOSE):]
                 self._inside = False
+                self._hidden = ""
         return "".join(out)
 
     def flush(self) -> str:
-        if self._inside:
-            return ""
         tail = self._carry
         self._carry = ""
+        if self._inside:
+            # An unclosed <think> at end of stream is far more likely literal
+            # text (the model quoting the tag, a code sample) than reasoning:
+            # give the held text back rather than swallowing the reply.
+            self._inside = False
+            hidden, self._hidden = self._hidden, ""
+            return _THINK_OPEN + hidden + tail
         return tail
 
 
@@ -291,7 +307,7 @@ async def _exec_bash(
         client = docker.from_env()
         container = client.containers.get(container_name)
         res = container.exec_run(
-            cmd=["timeout", str(_TOOL_TIMEOUT), "bash", "-lc", command],
+            cmd=["timeout", "-k", "5", str(_TOOL_TIMEOUT), "bash", "-lc", command],
             workdir=workdir,
             user="1000:1000",
             environment={"HOME": home},
@@ -313,8 +329,11 @@ async def _exec_bash(
 
     if len(out) > _MAX_TOOL_OUTPUT:
         out = out[:_MAX_TOOL_OUTPUT] + f"\n[...output truncated at {_MAX_TOOL_OUTPUT} chars...]"
-    if code == 124:
+    if code in (124, 137):
         out += f"\n[command exceeded {_TOOL_TIMEOUT}s and was killed]"
+    elif code not in (0, None) and out.strip():
+        # Non-zero with output used to read as success to the model.
+        out += f"\n[exit code {code}]"
     return out if out.strip() else f"(exit code {code}, no output)"
 
 
@@ -333,6 +352,7 @@ async def _stream_step(
     stripper = _ThinkStripper()
     content_parts: list[str] = []
     tool_acc: dict[int, dict[str, Any]] = {}
+    id_slots: dict[str, int] = {}
     finish_reason: str | None = None
     # OpenAI-compatible usage object from the final pre-[DONE] chunk, when
     # the server honours stream_options.include_usage. None if absent.
@@ -349,42 +369,74 @@ async def _stream_step(
                 logger.warning("haihub HTTP %s: %s", resp.status_code, body)
                 yield {"type": "_error", "message": f"haihub HTTP {resp.status_code}"}
                 return
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
+            # Split on "\n" ourselves: httpx's aiter_lines() uses str.splitlines(),
+            # which also breaks on U+2028/U+2029/U+0085 — characters JSON does
+            # not escape and models do emit — and a "data:" line split there
+            # fails json.loads twice and silently drops the chunk.
+            buf = b""
+            stream_done = False
+            async for raw_chunk in resp.aiter_bytes():
+                buf += raw_chunk
+                while not stream_done:
+                    nl = buf.find(b"\n")
+                    if nl == -1:
+                        break
+                    line = buf[:nl].decode("utf-8", "replace").rstrip("\r")
+                    buf = buf[nl + 1:]
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        stream_done = True
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        logger.warning("haihub: undecodable SSE chunk (%d bytes) skipped", len(data))
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    # Gateways that fail after sending 200 headers report it
+                    # in-band; without this the step looked like a clean empty
+                    # reply.
+                    err = obj.get("error")
+                    if isinstance(err, dict) or (err and not obj.get("choices")):
+                        msg = (err.get("message") if isinstance(err, dict) else str(err)) or "provider error"
+                        yield {"type": "_error", "message": f"provider error: {str(msg)[:200]}"}
+                        return
+                    # The usage object rides on the final chunk before [DONE]
+                    # (and that chunk usually has an empty ``choices`` list).
+                    if isinstance(obj.get("usage"), dict):
+                        usage = obj["usage"]
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    if choices[0].get("finish_reason"):
+                        finish_reason = str(choices[0]["finish_reason"])
+                    delta = choices[0].get("delta") or {}
+                    ctext = delta.get("content")
+                    if ctext:
+                        clean = stripper.feed(ctext)
+                        if clean:
+                            content_parts.append(clean)
+                            yield {"type": "delta", "text": clean}
+                    for pos, tc in enumerate(delta.get("tool_calls") or []):
+                        idx = tc.get("index")
+                        if idx is None:
+                            # No index: key by call id so parallel calls streamed
+                            # as whole objects don't all collapse into slot 0.
+                            cid = tc.get("id")
+                            idx = id_slots.setdefault(cid, len(tool_acc) + pos) if cid else len(tool_acc) + pos
+                        slot = tool_acc.setdefault(idx, {"id": None, "name": None, "args": ""})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            slot["args"] += fn["arguments"]
+                if stream_done:
                     break
-                try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                # The usage object rides on the final chunk before [DONE]
-                # (and that chunk usually has an empty ``choices`` list).
-                if isinstance(obj.get("usage"), dict):
-                    usage = obj["usage"]
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                if choices[0].get("finish_reason"):
-                    finish_reason = str(choices[0]["finish_reason"])
-                delta = choices[0].get("delta") or {}
-                ctext = delta.get("content")
-                if ctext:
-                    clean = stripper.feed(ctext)
-                    if clean:
-                        content_parts.append(clean)
-                        yield {"type": "delta", "text": clean}
-                for tc in (delta.get("tool_calls") or []):
-                    idx = tc.get("index", 0)
-                    slot = tool_acc.setdefault(idx, {"id": None, "name": None, "args": ""})
-                    if tc.get("id"):
-                        slot["id"] = tc["id"]
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        slot["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        slot["args"] += fn["arguments"]
     except Exception as exc:  # noqa: BLE001
         logger.exception("haihub stream failed")
         yield {"type": "_error", "message": f"haihub request failed: {type(exc).__name__}"}
@@ -568,6 +620,10 @@ async def run_turn(
                 tool_calls = meta["tool_calls"]
                 step_content = meta["content"]
                 finish = meta.get("finish_reason")
+
+                if finish is None and not tool_calls and not step_content.strip():
+                    yield {"type": "error", "message": f"{display}: stream ended without a reply or finish reason"}
+                    return
 
                 if finish == "length" and not tool_calls and not step_content.strip():
                     # The whole output budget went to hidden reasoning: the

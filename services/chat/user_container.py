@@ -744,6 +744,9 @@ def _ensure_egress_proxy_attached(
 # ---------------------------------------------------------------------------
 
 
+DOCKER_EXEC_TIMEOUT_SEC = 120
+
+
 def _docker_exec(
     container_name: str,
     cmd: list[str],
@@ -762,11 +765,14 @@ def _docker_exec(
     if stdin_bytes is not None:
         argv.append("-i")
     argv.extend(["--user", user, container_name, *cmd])
+    # Bounded: a wedged containerd used to hang the caller (and, through the
+    # sync call sites, the whole event loop) indefinitely.
     return subprocess.run(
         argv,
         input=stdin_bytes,
         capture_output=True,
         check=check,
+        timeout=DOCKER_EXEC_TIMEOUT_SEC,
     )
 
 
@@ -924,6 +930,31 @@ def _populate_lock(container_name: str) -> threading.Lock:
         return _POPULATE_LOCKS.setdefault(container_name, threading.Lock())
 
 
+def _refuse_main_credentials(account: str) -> None:
+    """Never stream the operator's primary login into a per-user container.
+
+    ``home_for_account`` falls back to MAIN_HOME for "main" and for any
+    unknown/removed account name, so a saturated pool (create_session used
+    to fall back to "main") or a stale session record could ship felix's
+    own bearer to a colleague's sandbox. CHAT_ACCOUNT_EXCLUDE="" re-allows
+    it explicitly."""
+    try:
+        from . import account_router  # type: ignore[no-redef]
+    except ImportError:
+        import account_router  # type: ignore[no-redef]
+    excluded = {
+        x.strip() for x in os.environ.get("CHAT_ACCOUNT_EXCLUDE", "main").split(",") if x.strip()
+    }
+    if "main" not in excluded:
+        return
+    home = account_router.home_for_account(account)
+    if account == "main" or home == account_router.MAIN_HOME:
+        raise RuntimeError(
+            f"refusing to stream the operator's primary credentials "
+            f"(account={account!r}) into a per-user container"
+        )
+
+
 def populate_credentials(container_name: str, account: str) -> None:
     """Stream the host's per-account credentials file into the per-user
     container at /var/claude-runner/.claude/.credentials.json.
@@ -935,6 +966,7 @@ def populate_credentials(container_name: str, account: str) -> None:
     impossible — either the file lands with the right perms or the exec
     fails and we surface the error.
     """
+    _refuse_main_credentials(account)
     src = _host_credentials_path(account)
     with open(src, "rb") as fh:
         payload = fh.read()
@@ -1118,7 +1150,7 @@ def start_auth_proxy(container_name: str) -> None:
         container_name,
         "sh", "-c", inner,
     ]
-    subprocess.run(argv, capture_output=True, check=True)
+    subprocess.run(argv, capture_output=True, check=True, timeout=30)
 
 
 def ensure_auth_proxy_running(container_name: str) -> None:

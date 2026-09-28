@@ -494,7 +494,7 @@ def test_credentials_isolation_unit_assertion_mode_0400_owner_2000(monkeypatch, 
             self.stdout = b""
             self.stderr = b""
 
-    def fake_run(argv, *, input=None, capture_output=True, check=True):
+    def fake_run(argv, *, input=None, capture_output=True, check=True, timeout=None):
         captured.append({"argv": list(argv), "stdin": input})
         return _CP()
 

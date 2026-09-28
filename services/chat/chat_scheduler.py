@@ -54,6 +54,11 @@ LEASE_SECONDS = 7200.0
 # A wake whose computed delay/interval is below this is clamped up — guards
 # against a model emitting ``in: "0s"`` and the tick loop hot-looping.
 _MIN_DELAY_SECONDS = 5.0
+# A recurring wake is a full model turn every time it fires. Anything under
+# this would be a runaway loop (a model typo like ``every: "1"`` used to give
+# a turn on every 30 s tick); clamped up, and the caller sees the clamped
+# interval echoed back.
+_MIN_INTERVAL_SECONDS = 300.0
 # Don't let a single session accumulate unbounded timers (a runaway loop or a
 # confused model). Registration past this is rejected.
 MAX_PER_SESSION = 25
@@ -78,7 +83,19 @@ def _load() -> dict[str, Any]:
     try:
         with open(_store_path(), "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
+        return {"schedules": [], "counter": 0}
+    except (json.JSONDecodeError, OSError) as exc:
+        # Never let a transient read error or a corrupt file turn into an
+        # empty store that the next _save persists (= every user's wakes
+        # gone). Set the bad file aside so it can be recovered by hand.
+        path = _store_path()
+        aside = f"{path}.corrupt-{int(time.time())}"
+        try:
+            os.replace(path, aside)
+        except OSError:
+            pass
+        _log.error("schedule store unreadable (%s); moved aside to %s", exc, aside)
         return {"schedules": [], "counter": 0}
     if not isinstance(data, dict):
         return {"schedules": [], "counter": 0}
@@ -185,11 +202,16 @@ def register(
 
     interval: Optional[float] = None
     if every_seconds is not None:
-        interval = max(_MIN_DELAY_SECONDS, float(every_seconds))
+        interval = max(_MIN_INTERVAL_SECONDS, float(every_seconds))
 
     with _lock:
         data = _load()
-        active = [s for s in data["schedules"] if s.get("session_id") == session_id]
+        # A leased one-shot (fire in progress / being requeued) is not a
+        # competing timer; counting it made a requeue at the cap always fail.
+        active = [
+            s for s in data["schedules"]
+            if s.get("session_id") == session_id and not s.get("leased_at")
+        ]
         if len(active) >= MAX_PER_SESSION:
             raise ValueError(
                 f"session already has {len(active)} scheduled wakes (max {MAX_PER_SESSION})"

@@ -139,7 +139,7 @@ def quiet_storage(monkeypatch):
     written: list[tuple] = []
     monkeypatch.setattr(
         app.storage, "update_assistant_message",
-        lambda e, s, seq, content, status: written.append((status, content)))
+        lambda e, s, seq, content, status, **kw: written.append((status, content)))
 
     async def _noop_img(session_id):
         return None

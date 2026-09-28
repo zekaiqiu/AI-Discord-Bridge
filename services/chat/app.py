@@ -21,11 +21,13 @@ import asyncio
 import io
 import json
 import logging
+import math
 import mimetypes
 import os
 import urllib.parse
 import re
 import tarfile
+import tempfile
 import time
 from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
@@ -266,8 +268,10 @@ def _spawn_background(coro: Any) -> asyncio.Task[Any]:
 # ---------------------------------------------------------------------------
 
 def _user_email(claims: dict[str, Any]) -> str:
-    """Trust boundary: ``require_user`` already enforced presence + type."""
-    return claims["email"]
+    """Trust boundary: ``require_user`` already enforced presence + type.
+    Normalised (strip + lower) so a differently-cased email from the IdP maps
+    to the same user dir and passes the per-file ownership check."""
+    return str(claims["email"]).strip().lower()
 
 
 def _felix_email() -> str:
@@ -292,6 +296,10 @@ def _admin_emails() -> frozenset[str]:
     raw = os.environ.get("ADMIN_EMAILS")
     if raw:
         items = [s.strip() for s in raw.split(",") if s.strip()]
+    elif os.environ.get("AUTH_MODE", "").strip().lower() == "local":
+        # Fail closed for a local-auth tenant: the module defaults are the
+        # ald3 personal addresses, and admin turns run in the host shell.
+        return frozenset()
     else:
         items = list(DEFAULT_ADMIN_EMAILS)
     items.append(_felix_email())
@@ -568,6 +576,10 @@ def _format_prior_history(messages: list[dict[str, Any]]) -> str:
         content = m.get("content")
         if not isinstance(content, str) or not content.strip():
             continue
+        if role == "assistant" and m.get("status") == "error":
+            # Failure notices are not conversation; feeding them back teaches
+            # the model to reproduce them.
+            continue
         if role == "user":
             lines.append(f"User: {content}")
         elif role == "assistant":
@@ -591,10 +603,15 @@ def _stateless_history(messages: list[dict[str, Any]]) -> str | None:
     if not text:
         return None
     if len(text) > _STATELESS_HISTORY_MAX_CHARS:
+        tail = text[-_STATELESS_HISTORY_MAX_CHARS:]
+        # Cut at a turn boundary so the model never sees half a code fence
+        # or a truncated "User:" line.
+        at = tail.find("\n\nUser: ")
+        if at != -1:
+            tail = tail[at + 2:]
         text = (
             "[Earlier history truncated — only the most recent part of this "
-            "conversation is shown.]\n\n"
-            + text[-_STATELESS_HISTORY_MAX_CHARS:]
+            "conversation is shown.]\n\n" + tail
         )
     return text
 
@@ -713,7 +730,9 @@ async def _recover_turn(rec: dict[str, Any]) -> bool:
         _settings_blob = {}
     if not isinstance(_settings_blob, dict):
         _settings_blob = {}
-    model = _normalize_model(_settings_blob.get("default_model"))
+    turn_cfg = rec.get("turn") if isinstance(rec.get("turn"), dict) else {}
+    model = _normalize_model(turn_cfg.get("model") or _settings_blob.get("default_model"))
+    effort = _validated_effort(model, turn_cfg.get("effort"))
     is_first_turn = not session.get("claude_initialized")
     if is_first_turn:
         try:
@@ -735,7 +754,7 @@ async def _recover_turn(rec: dict[str, Any]) -> bool:
             title_was_empty=not session.get("title"),
             lock=lock,
             model=model,
-            effort=None,
+            effort=effort,
             prior_history=prior_history,
             stateless_history=_stateless_history(prior),
         )
@@ -743,8 +762,10 @@ async def _recover_turn(rec: dict[str, Any]) -> bool:
     _active_tasks[key] = task
 
     def _cleanup(_t: asyncio.Task[None], _k: tuple[str, str] = key) -> None:
-        _active_runs.pop(_k, None)
-        _active_tasks.pop(_k, None)
+        if _active_runs.get(_k) is run:
+            _active_runs.pop(_k, None)
+        if _active_tasks.get(_k) is _t:
+            _active_tasks.pop(_k, None)
 
     task.add_done_callback(_cleanup)
     logger.warning(
@@ -1167,6 +1188,21 @@ _MEMORY_UPDATE_ANY_RE = re.compile(
     r"[ \t]*\n*<memory_update>\s*\n?(.*?)\n?\s*</memory(?:_update)?>[ \t]*\n?",
     re.DOTALL,
 )
+# Strict closer first: a block that wraps a nested <memory>…</memory> would
+# otherwise be cut at the inner closer and leak "</memory_update>" into the
+# reply.
+_MEMORY_UPDATE_STRICT_RE = re.compile(
+    r"[ \t]*\n*<memory_update>\s*\n?(.*?)\n?\s*</memory_update>[ \t]*\n?",
+    re.DOTALL,
+)
+_FENCE_RE = re.compile(r"^\s*(```|~~~)", re.MULTILINE)
+
+
+def _inside_code_fence(text: str, pos: int) -> bool:
+    """True when ``pos`` falls inside a ``` / ~~~ fenced block — the model
+    quoting the memory protocol (or cat-ing a file that contains the tag)
+    must not overwrite the user's memory."""
+    return sum(1 for _ in _FENCE_RE.finditer(text, 0, pos)) % 2 == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1262,7 +1298,7 @@ def _ensure_artifacts_dir(
                 container_name,
                 ["sh", "-c",
                  f"mkdir -p /workspace/.artifacts/{session_id} && "
-                 f"chown -R 1000:1000 /workspace/.artifacts"],
+                 f"chown 1000:1000 /workspace/.artifacts /workspace/.artifacts/{session_id}"],
                 user="root",
                 check=False,
             )
@@ -1271,6 +1307,10 @@ def _ensure_artifacts_dir(
                 "ensure_artifacts_dir(user) failed for %s in %s",
                 session_id, container_name,
             )
+
+
+_ARTIFACT_TAR_MAX_BYTES = 512 * 1024 * 1024
+_ARTIFACT_FILE_MAX_BYTES = 128 * 1024 * 1024
 
 
 def _collect_user_container_artifacts(
@@ -1303,13 +1343,34 @@ def _collect_user_container_artifacts(
     except Exception:
         logger.exception("get_archive failed for %s:%s", container_name, src_path)
         return
-    buf = b"".join(chunk for chunk in stream)
+    # Bounded and off-heap: the dir is user-writable (uid 1000 in the user's
+    # own sandbox), so a multi-GB file there must not be slurped into the
+    # backend's memory (no mem limit on this container → host swap thrash).
+    tmp = tempfile.TemporaryFile()
+    total = 0
+    for chunk in stream:
+        total += len(chunk)
+        if total > _ARTIFACT_TAR_MAX_BYTES:
+            logger.warning(
+                "collect_artifacts: %s:%s exceeds %d bytes; skipping",
+                container_name, src_path, _ARTIFACT_TAR_MAX_BYTES,
+            )
+            tmp.close()
+            return
+        tmp.write(chunk)
+    tmp.seek(0)
     gen_dir.mkdir(parents=True, exist_ok=True)
     gen_root = gen_dir.resolve()
     try:
-        with tarfile.open(fileobj=io.BytesIO(buf), mode="r") as tar:
+        with tarfile.open(fileobj=tmp, mode="r") as tar:
             for member in tar.getmembers():
                 if not member.isfile():
+                    continue
+                if member.size > _ARTIFACT_FILE_MAX_BYTES:
+                    logger.warning(
+                        "collect_artifacts: skipping %s (%d bytes > cap)",
+                        member.name, member.size,
+                    )
                     continue
                 # get_archive wraps everything under <session_id>/. Strip
                 # that prefix so files land directly in gen_dir.
@@ -1551,7 +1612,9 @@ def _scan_new_artifacts(
             size = p.stat().st_size
         except OSError:
             continue
-        if mtime <= since_ts:
+        # get_archive truncates mtimes to whole seconds; compare against the
+        # floor so a file written in the turn's first second is not dropped.
+        if mtime < math.floor(since_ts):
             continue
         out.append({
             "filename": p.name,
@@ -1597,14 +1660,34 @@ def _extract_memory_update(text: str) -> tuple[str, str | None]:
     """
     if not text:
         return text, None
-    matches = list(_MEMORY_UPDATE_ANY_RE.finditer(text))
+    # Per block: prefer the strict </memory_update> closer when one exists at
+    # that position (a nested <memory>…</memory> wrapper would otherwise cut
+    # the block short); fall back to the abbreviated closer.
+    matches = []
+    pos = 0
+    while True:
+        m = _MEMORY_UPDATE_ANY_RE.search(text, pos)
+        if m is None:
+            break
+        strict = _MEMORY_UPDATE_STRICT_RE.match(text, m.start())
+        chosen = strict if strict is not None else m
+        pos = chosen.end()
+        if not _inside_code_fence(text, chosen.start()):
+            matches.append(chosen)
     if not matches:
         return text, None
-    # Last block wins (the model's final view of memory); every block is
-    # stripped from what the user sees.
-    new_memory = matches[-1].group(1).strip()
-    scrubbed = _MEMORY_UPDATE_ANY_RE.sub("", text).rstrip()
-    return scrubbed, new_memory
+    # Last non-empty block wins (the model's final view of memory); every
+    # matched block is stripped from what the user sees. An empty block is
+    # "nothing to record", never "wipe memory".
+    new_memory: str | None = None
+    for m in reversed(matches):
+        if m.group(1).strip():
+            new_memory = m.group(1).strip()
+            break
+    scrubbed = text
+    for m in reversed(matches):
+        scrubbed = scrubbed[: m.start()] + scrubbed[m.end():]
+    return scrubbed.rstrip(), new_memory
 
 
 # ---------------------------------------------------------------------------
@@ -1650,12 +1733,13 @@ async def create_session(
         choice = account_router.pick()
         account_name = choice.name
     except account_router.NoAccountsAvailable:
-        # Either no wizerith accounts onboarded yet (fine — single-account
-        # mode) or all accounts saturated. Either way, fall back to main.
-        account_name = "main"
+        # No usable pooled account. Leave the session unpinned: the runner
+        # resolves an account per turn, and populate_credentials refuses to
+        # ship the operator's primary login into a per-user container.
+        account_name = None
     except Exception:
-        logger.exception("account_router.pick failed; falling back to main")
-        account_name = "main"
+        logger.exception("account_router.pick failed; leaving session unpinned")
+        account_name = None
     # Lock the role at create time so dispatch (admin → chat-host-shell vs
     # user → per-user container) is stable for the session's lifetime.
     email = _user_email(claims)
@@ -1691,7 +1775,7 @@ async def create_session(
     if role == "user":
         try:
             if requested_workspace == "shared":
-                container_name = user_container.ensure_shared_container()
+                container_name = await asyncio.to_thread(user_container.ensure_shared_container)
                 # Record the shared container's PREFERRED account, resolved
                 # to a usable one — refresh_credentials_if_stale re-resolves
                 # on every turn, so this is a label for consistency, not a
@@ -1701,7 +1785,7 @@ async def create_session(
                     user_container.shared_container_account()
                 )
             else:
-                container_name = user_container.ensure_user_container(email)
+                container_name = await asyncio.to_thread(user_container.ensure_user_container, email)
         except user_container.SharedContainerNotConfigured as exc:
             # The env-disabled case is already caught above; this is the
             # belt-and-braces re-raise path if env is unset between the
@@ -1868,16 +1952,25 @@ async def export_session(
     session = storage.get_session(email, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
-    title_slug = (session.get("title") or "session").lower()
-    title_slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in title_slug)
-    title_slug = title_slug.strip("-") or "session"
+    raw_title = (session.get("title") or "session").strip() or "session"
+    # Header values are latin-1: keep an ASCII slug for ``filename=`` and
+    # carry the real (e.g. Chinese) title in RFC 5987 ``filename*=``. The old
+    # slug kept any isalnum() char, so a CJK title 500'd the export.
+    title_slug = "".join(
+        c if (c.isascii() and c.isalnum()) or c in "-_" else "-" for c in raw_title.lower()
+    ).strip("-") or "session"
+    def _disposition(ext: str) -> str:
+        return (
+            f'attachment; filename="{title_slug}.{ext}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(raw_title, safe='')}.{ext}"
+        )
     if format == "json":
         body = json.dumps(session, ensure_ascii=False, indent=2)
         return Response(
             content=body,
             media_type="application/json",
             headers={
-                "Content-Disposition": f'attachment; filename="{title_slug}.json"',
+                "Content-Disposition": _disposition("json"),
             },
         )
     md = storage.export_session_markdown(email, session_id) or ""
@@ -1885,7 +1978,7 @@ async def export_session(
         content=md,
         media_type="text/markdown; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="{title_slug}.md"',
+            "Content-Disposition": _disposition("md"),
         },
     )
 
@@ -1926,7 +2019,23 @@ async def delete_session(
     session_id: str,
     claims: dict[str, Any] = Depends(require_user),
 ) -> Response:
-    ok = storage.delete_session(_user_email(claims), session_id)
+    email = _user_email(claims)
+    key = (email, session_id)
+    run = _active_runs.get(key)
+    if run is not None:
+        # Stop the in-flight turn so it cannot keep executing tools and
+        # recreate the generated dir after we purge it.
+        run.cancel_requested = True
+        gen = getattr(run, "_gen", None)
+        if gen is not None:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+        task = _active_tasks.get(key)
+        if task is not None and not task.done():
+            task.cancel()
+    ok = storage.delete_session(email, session_id)
     if not ok:
         # Storage refused (missing or cross-email). Do NOT touch the
         # attachments dir in this case — purging would reveal that some
@@ -2197,7 +2306,7 @@ def _api_attachment_preamble(attachments_dir: Path, tool_path: str) -> str:
     )
 
 
-def _api_model_turn_gen(
+async def _api_model_turn_gen(
     *,
     model: str,
     user_text: str,
@@ -2242,7 +2351,9 @@ def _api_model_turn_gen(
     if attachments_dir is not None and tool_container:
         dispatch = "user" if container else "host"
         try:
-            tool_attach = claude_runner._claude_attachments_path(
+            # put_archive + exec into the container: keep it off the event loop.
+            tool_attach = await asyncio.to_thread(
+                claude_runner._claude_attachments_path,
                 attachments_dir, dispatch=dispatch, container_name=container,
             )
         except Exception:
@@ -2285,6 +2396,13 @@ _session_mgr = SessionProcessManager()
 _ERROR_NOTICE = "\n\n_\u26a0 generation failed: {message}_"
 
 
+def _scrub_partial(partial: str) -> str:
+    """A cancelled/errored turn keeps its partial text but never a raw
+    <memory_update> block (it would show in the thread and re-enter history)."""
+    scrubbed, _ = _extract_memory_update(partial or "")
+    return scrubbed
+
+
 def _with_error_notice(partial: str, message: str) -> str:
     """Fold a turn's failure reason into the persisted assistant content.
 
@@ -2308,6 +2426,7 @@ async def _consume_into_run(
     container: str | None,
     artifacts_dispatch: str,
     turn_start_ts: float,
+    memory_at_start: str | None = None,
 ) -> str:
     """Consume one normalised event stream into ``run``: stream deltas/tool
     events, and on terminal persist the assistant message + finalize.
@@ -2349,16 +2468,18 @@ async def _consume_into_run(
             })
         elif et == "done":
             assistant_text = event.get("full_text") or "".join(full_text_parts)
+            turn_meta = event.get("meta") if isinstance(event.get("meta"), dict) else None
             assistant_text, new_memory = _extract_memory_update(assistant_text)
             if new_memory is not None:
                 try:
-                    storage.set_memory(email, new_memory)
+                    storage.set_memory_merged(email, new_memory, memory_at_start)
                 except Exception:
                     logger.exception(
                         "set_memory failed for %s after turn complete", email,
                     )
             if artifacts_dispatch == "user" and container:
-                _collect_user_container_artifacts(
+                await asyncio.to_thread(
+                    _collect_user_container_artifacts,
                     session_id=session_id, container_name=container,
                 )
             try:
@@ -2388,6 +2509,7 @@ async def _consume_into_run(
                     email, session_id, assistant_seq,
                     content=assistant_text,
                     status=storage.ASSISTANT_STATUS_COMPLETE,
+                    meta=turn_meta,
                 )
             except Exception:
                 logger.exception(
@@ -2400,7 +2522,7 @@ async def _consume_into_run(
                 await run.emit({"type": "memory_updated"})
             if _scheduled_n:
                 await run.emit({"type": "schedules_updated"})
-            await run.finalize({"type": "done", "full_text": assistant_text})
+            await run.finalize({"type": "done", "full_text": assistant_text, "meta": turn_meta})
             return "complete"
         elif et == "error":
             partial = "".join(full_text_parts)
@@ -2408,7 +2530,7 @@ async def _consume_into_run(
             try:
                 storage.update_assistant_message(
                     email, session_id, assistant_seq,
-                    content=_with_error_notice(partial, err_message),
+                    content=_with_error_notice(_scrub_partial(partial), err_message),
                     status=storage.ASSISTANT_STATUS_ERROR,
                 )
             except Exception:
@@ -2428,7 +2550,7 @@ async def _consume_into_run(
         try:
             storage.update_assistant_message(
                 email, session_id, assistant_seq,
-                content=partial,
+                content=_scrub_partial(partial),
                 status=storage.ASSISTANT_STATUS_CANCELLED,
             )
         except Exception:
@@ -2514,7 +2636,7 @@ async def _on_auto_turn(key: tuple[str, str], turn: Any) -> None:
         try:
             storage.update_assistant_message(
                 email, session_id, assistant_seq,
-                content=_with_error_notice(partial, f"auto-turn crashed: {exc!s}"),
+                content=_with_error_notice(_scrub_partial(partial), f"auto-turn crashed: {exc!s}"),
                 status=storage.ASSISTANT_STATUS_ERROR,
             )
         except Exception:
@@ -2627,11 +2749,15 @@ async def _fire_schedule_locked(rec: dict[str, Any]) -> None:
     try:
         if key in _active_runs:
             # An auto-continuation turn slipped in under the lock window.
-            chat_scheduler.requeue(email, session_id, prompt, delay_seconds=120,
-                                   note=rec.get("note"),
-                                   attempt=int(rec.get("attempt") or 0))
+            # Counted as an attempt so a permanently busy session eventually
+            # gives up instead of re-arming every two minutes forever.
+            _requeue_failed_wake(rec, "run already active")
             logger.info("scheduled wake %s: run already active, requeued", sched_id)
             return
+        # The snapshot above was taken before we waited for the lock; a turn
+        # may have completed meanwhile (claude_initialized flipped, messages
+        # appended). Everything below must see the current state.
+        session = storage.get_session(email, session_id) or session
         role = session.get("role")
         container = session.get("container")
         account = session.get("account")
@@ -2745,7 +2871,7 @@ async def _fire_schedule_locked(rec: dict[str, Any]) -> None:
                 # thread's transcript (everything before the placeholder we
                 # just appended) as history so the wake knows what it is
                 # following up on.
-                gen = _api_model_turn_gen(
+                gen = await _api_model_turn_gen(
                     model=wake_model,
                     user_text=wake_text,
                     role=role,
@@ -2770,10 +2896,11 @@ async def _fire_schedule_locked(rec: dict[str, Any]) -> None:
                     chat_session_id=session_id,
                     output_language=output_language, user_email=email,
                 )
+            run._gen = gen  # type: ignore[attr-defined]  # so /cancel can close it
             status = await _consume_into_run(
                 run, gen, full_text_parts,
                 container=container, artifacts_dispatch=artifacts_dispatch,
-                turn_start_ts=time.time(),
+                turn_start_ts=time.time(), memory_at_start=memory,
             )
             if status == "error":
                 # The turn died without producing a message (account cooldown,
@@ -2929,7 +3056,7 @@ async def _run_turn_worker(
                 email=email,
                 session_id=session_id,
                 claude_session_id=claude_session_id,
-                user_text=user_text,
+                user_text=user_text.replace(_RECOVERY_NOTE, ""),
             )
         )
 
@@ -2959,6 +3086,7 @@ async def _run_turn_worker(
     except Exception:
         logger.exception("get_memory failed for %s", email)
         memory = ""
+    memory_at_start: str | None = memory
     # Inline artifacts. Pre-create the per-session dir so claude doesn't
     # have to mkdir before its first save, and stamp the start time so we
     # can scan for files NEW to this turn (skipping older image-gen output).
@@ -2993,7 +3121,7 @@ async def _run_turn_worker(
             # runner with the SAME normalized event contract the consume
             # loop below expects. Being stateless they get this session's
             # full prior transcript every turn (stateless_history).
-            gen = _api_model_turn_gen(
+            gen = await _api_model_turn_gen(
                 model=model,
                 user_text=user_text,
                 role=role,
@@ -3091,6 +3219,7 @@ async def _run_turn_worker(
                 })
             elif et == "done":
                 assistant_text = event.get("full_text") or "".join(full_text_parts)
+                turn_meta = event.get("meta") if isinstance(event.get("meta"), dict) else None
                 # If the model emitted a <memory_update> sentinel at the
                 # end of its response, persist the new memory and strip
                 # the block from what we save / show. Memory updates only
@@ -3099,7 +3228,7 @@ async def _run_turn_worker(
                 assistant_text, new_memory = _extract_memory_update(assistant_text)
                 if new_memory is not None:
                     try:
-                        storage.set_memory(email, new_memory)
+                        storage.set_memory_merged(email, new_memory, memory_at_start)
                     except Exception:
                         logger.exception(
                             "set_memory failed for %s after turn complete", email,
@@ -3112,7 +3241,8 @@ async def _run_turn_worker(
                 # AND embedded in the persisted assistant message so a
                 # session reload still shows the artifacts.
                 if _artifacts_dispatch == "user" and container:
-                    _collect_user_container_artifacts(
+                    await asyncio.to_thread(
+                        _collect_user_container_artifacts,
                         session_id=session_id, container_name=container,
                     )
                 # Resolve any autonomous image-gen requests the model
@@ -3151,6 +3281,7 @@ async def _run_turn_worker(
                         email, session_id, assistant_seq,
                         content=assistant_text,
                         status=storage.ASSISTANT_STATUS_COMPLETE,
+                        meta=turn_meta,
                     )
                 except Exception:
                     logger.exception(
@@ -3167,7 +3298,7 @@ async def _run_turn_worker(
                     await run.emit({"type": "memory_updated"})
                 if _scheduled_n:
                     await run.emit({"type": "schedules_updated"})
-                await run.finalize({"type": "done", "full_text": assistant_text})
+                await run.finalize({"type": "done", "full_text": assistant_text, "meta": turn_meta})
                 saw_terminal = True
                 # Title task already kicked off at worker entry (spawned
                 # in parallel with the main turn). Nothing to schedule
@@ -3179,7 +3310,7 @@ async def _run_turn_worker(
                 try:
                     storage.update_assistant_message(
                         email, session_id, assistant_seq,
-                        content=_with_error_notice(partial, err_message),
+                        content=_with_error_notice(_scrub_partial(partial), err_message),
                         status=storage.ASSISTANT_STATUS_ERROR,
                     )
                 except Exception:
@@ -3203,7 +3334,7 @@ async def _run_turn_worker(
                 try:
                     storage.update_assistant_message(
                         email, session_id, assistant_seq,
-                        content=partial,
+                        content=_scrub_partial(partial),
                         status=storage.ASSISTANT_STATUS_CANCELLED,
                     )
                 except Exception:
@@ -3244,7 +3375,7 @@ async def _run_turn_worker(
             try:
                 storage.update_assistant_message(
                     email, session_id, assistant_seq,
-                    content=partial,
+                    content=_scrub_partial(partial),
                     status=storage.ASSISTANT_STATUS_CANCELLED,
                 )
             except Exception:
@@ -3267,7 +3398,7 @@ async def _run_turn_worker(
         try:
             storage.update_assistant_message(
                 email, session_id, assistant_seq,
-                content=_with_error_notice(partial, f"worker crashed: {exc!s}"),
+                content=_with_error_notice(_scrub_partial(partial), f"worker crashed: {exc!s}"),
                 status=storage.ASSISTANT_STATUS_ERROR,
             )
         except Exception:
@@ -3285,6 +3416,26 @@ async def _run_turn_worker(
         # Identity-guarded: a CLI-initiated auto-continuation turn (A1) may have
         # already registered its own run under this key right after our `done`;
         # don't pop it.
+        # Close the generator and purge this turn's uploads BEFORE the lock is
+        # released: both await, and a post_message waiting on the lock used to
+        # slip in between, snapshot fresh uploads for turn N+1 — which the
+        # purge below then deleted (chips shown, files never reached the model).
+        if gen is not None:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+        # Purge the per-session attachments dir on every terminal so files
+        # uploaded for THIS turn don't silently re-enter the model context on
+        # the next turn. Keep them if we are dying with the process: the
+        # re-run after restart needs them.
+        if not _shutting_down:
+            try:
+                attachments.delete_attachments_dir(session_id)
+            except Exception:  # pragma: no cover — best-effort
+                logger.exception(
+                    "attachments cleanup failed for %s", session_id,
+                )
         if _active_runs.get(key) is run:
             _active_runs.pop(key, None)
         if _active_tasks.get(key) is asyncio.current_task():
@@ -3294,27 +3445,6 @@ async def _run_turn_worker(
                 lock.release()
             except RuntimeError:
                 pass
-        # Best-effort gen cleanup; ignore if already closed.
-        if gen is not None:
-            try:
-                await gen.aclose()
-            except Exception:
-                pass
-        # Phase 5 (EB-M2 fix — audit/extra_bugs.md): purge the
-        # per-session attachments dir on every terminal so files
-        # uploaded for THIS turn don't silently re-enter the model
-        # context on the next turn. Idempotent (no-op when there
-        # are no attachments). Run AFTER gen.aclose() so we don't
-        # race with the subprocess still reading the dir.
-        # Keep the uploads if we are dying with the process: the re-run
-        # after restart needs them.
-        if not _shutting_down:
-            try:
-                attachments.delete_attachments_dir(session_id)
-            except Exception:  # pragma: no cover — best-effort
-                logger.exception(
-                    "attachments cleanup failed for %s", session_id,
-                )
 
 
 # ===========================================================================
@@ -3325,6 +3455,19 @@ async def _run_turn_worker(
 # ===========================================================================
 
 import uuid as _uuid_for_imgname  # noqa: E402
+
+
+def _persist_turn_error(email: str, session_id: str, seq: int, message: str) -> None:
+    """Best-effort: mark the placeholder as errored so it never lingers at
+    'streaming' (which reads as a hung turn and would be re-run at boot)."""
+    try:
+        storage.update_assistant_message(
+            email, session_id, seq,
+            content=_with_error_notice("", message),
+            status=storage.ASSISTANT_STATUS_ERROR,
+        )
+    except Exception:
+        logger.exception("persist_turn_error failed for %s seq=%s", session_id, seq)
 
 
 async def _run_image_worker(
@@ -3359,6 +3502,7 @@ async def _run_image_worker(
             return
         except Exception as exc:  # defence: never let the worker raise
             logger.exception("image worker crashed for %s seq=%s", session_id, assistant_seq)
+            _persist_turn_error(email, session_id, assistant_seq, f"image worker crashed: {exc!s}")
             await run.finalize({"type": "error", "message": f"image worker crashed: {exc!s}"})
             return
 
@@ -3372,6 +3516,7 @@ async def _run_image_worker(
             gen_dir.mkdir(parents=True, mode=0o750, exist_ok=True)
         except Exception:
             logger.exception("could not create generated dir for %s", session_id)
+            _persist_turn_error(email, session_id, assistant_seq, "image persist failed")
             await run.finalize({"type": "error", "message": "image persist failed"})
             return
         filename = f"{_uuid_for_imgname.uuid4().hex[:16]}.{ext}"
@@ -3381,6 +3526,7 @@ async def _run_image_worker(
             os.chmod(path, 0o640)
         except Exception:
             logger.exception("could not write generated image for %s", session_id)
+            _persist_turn_error(email, session_id, assistant_seq, "image persist failed")
             await run.finalize({"type": "error", "message": "image persist failed"})
             return
 
@@ -3407,6 +3553,20 @@ async def _run_image_worker(
             await run.finalize({"type": "error", "message": "persistence failed"})
             return
         await run.finalize({"type": "done", "full_text": markdown})
+    except asyncio.CancelledError:
+        # Stop during image generation: persist + finalise like the chat
+        # worker does, or the SSE never closes and the bubble spins forever.
+        try:
+            storage.update_assistant_message(
+                email, session_id, assistant_seq,
+                content="", status=storage.ASSISTANT_STATUS_CANCELLED,
+            )
+        except Exception:
+            logger.exception("update_assistant_message(image-cancel) failed for %s", session_id)
+        try:
+            await run.finalize({"type": "cancelled", "full_text": ""})
+        except Exception:
+            pass
     finally:
         key = (email, session_id)
         # Identity-guarded: a CLI-initiated auto-continuation turn (A1) may have
@@ -3617,7 +3777,12 @@ async def post_message(
     if session.get("role") is None:
         healed_fields["role"] = _resolve_role(email)
     if not session.get("account"):
-        healed_fields["account"] = account_router.pick().name
+        try:
+            healed_fields["account"] = account_router.pick().name
+        except Exception:
+            # Saturated/dead pool: the glm/kimi path does not need one, and a
+            # 500 here would block the turn for nothing.
+            pass
     effective_role = healed_fields.get("role", session.get("role"))
     # Workspace defaults to "personal" for legacy sessions that pre-date
     # the shared-workspace toggle. Shared sessions whose container name
@@ -3632,7 +3797,7 @@ async def post_message(
         needs_heal = not persisted_container
         if persisted_container and not needs_heal:
             try:
-                docker.from_env().containers.get(persisted_container)
+                await asyncio.to_thread(lambda: docker.from_env().containers.get(persisted_container))
             except docker.errors.NotFound:
                 needs_heal = True
             except Exception:
@@ -3644,7 +3809,7 @@ async def post_message(
         if needs_heal:
             try:
                 if effective_workspace == "shared":
-                    healed_fields["container"] = user_container.ensure_shared_container()
+                    healed_fields["container"] = await asyncio.to_thread(user_container.ensure_shared_container)
                     # Match create_session: record the shared container's
                     # preferred account resolved to a usable one (per-turn
                     # re-resolution makes this a label, not a hard pin).
@@ -3652,7 +3817,7 @@ async def post_message(
                         user_container.shared_container_account()
                     )
                 else:
-                    healed_fields["container"] = user_container.ensure_user_container(email)
+                    healed_fields["container"] = await asyncio.to_thread(user_container.ensure_user_container, email)
             except Exception:
                 logger.exception(
                     "ensure_%s_container failed for legacy session %s; runner will fail closed",
@@ -3791,6 +3956,7 @@ async def post_message(
             session, _user_seq = storage.append_user_message(
                 email, session_id, user_text,
                 attachments=attachments_meta_for_user or None,
+                turn={"mode": user_mode, "model": user_model, "effort": user_effort},
             )
             # Stash bytes to the per-seq preview dir so the SPA can render
             # the attachments on reload. Best-effort: a copy failure
@@ -3868,8 +4034,12 @@ async def post_message(
     # placeholder; we slice off everything before those.
     prior_history: str | None = None
     stateless_history: str | None = None
-    if prior_messages_count > 0:
-        prior = (session.get("messages") or [])[:prior_messages_count]
+    # ``session`` is the post-append snapshot (…, user msg, placeholder), so
+    # everything before the last two entries is the prior transcript — read
+    # fresh rather than from the pre-lock count, which missed a wake that
+    # finished while we waited for the lock.
+    prior = (session.get("messages") or [])[:-2]
+    if prior:
         # Stateless runners (glm/kimi/qwen/...) need the whole transcript on
         # every turn; the claude path only wants it on a fork's first turn.
         stateless_history = _stateless_history(prior)
@@ -3909,8 +4079,10 @@ async def post_message(
     # the registry can never leak even if the worker's finally somehow
     # bypasses the pop.  Defence in depth.
     def _cleanup_on_task_done(_t: asyncio.Task[None], _k: tuple[str, str] = key) -> None:
-        _active_runs.pop(_k, None)
-        _active_tasks.pop(_k, None)
+        if _active_runs.get(_k) is run:
+            _active_runs.pop(_k, None)
+        if _active_tasks.get(_k) is _t:
+            _active_tasks.pop(_k, None)
     task.add_done_callback(_cleanup_on_task_done)
 
     return StreamingResponse(

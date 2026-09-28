@@ -244,6 +244,18 @@ class SessionProcess:
                     self._current = None
         except asyncio.CancelledError:
             raise
+        except Exception:
+            # A dead pump with a live subprocess is the worst state: alive()
+            # stays True, every send_user() returns a Turn that never gets
+            # events. Tear the process down so the next turn respawns it.
+            import logging
+            logging.getLogger(__name__).exception("session pump died; closing process")
+            self._closed = True
+            try:
+                if self._proc is not None and self._proc.returncode is None:
+                    self._proc.kill()
+            except Exception:
+                pass
         finally:
             # Process ended: close any open turn and stop auto-turn iteration.
             if self._current is not None:

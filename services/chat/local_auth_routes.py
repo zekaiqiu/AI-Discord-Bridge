@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import time
 
+import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
 
@@ -63,6 +64,7 @@ class LanguageBody(BaseModel):
 
 @router.post("/login")
 async def login(body: LoginBody, request: Request, response: Response):
+    _passwordless_only()
     email = local_auth._normalize_email(body.email)
     ip = local_auth.client_ip(request)
     # fix #1: gate before doing any work, so neither password guessing per
@@ -81,8 +83,34 @@ async def login(body: LoginBody, request: Request, response: Response):
     return {"email": email, "token": token}
 
 
+def _passwordless_only() -> None:
+    """The wizerith tenant is passwordless (email code → cookie). Its password
+    endpoints were still mounted and, unlike /request-code, ungated: any
+    mailbox could mint a valid SSO cookie via reset-password and pass the
+    Caddy forward_auth on every gated host. Off in passwordless mode."""
+    if local_auth._passwordless():
+        raise HTTPException(status_code=404, detail="not found")
+
+
+def _allowlist_gate(email: str) -> None:
+    """Explicit ALLOWED_EMAILS membership OR domain match; pass-through when
+    no domain list is configured (open-registration tenants)."""
+    if email in local_auth._allowed_emails():
+        return
+    domains = local_auth._allowed_email_domains()
+    if not domains:
+        return
+    domain = email.split("@", 1)[1] if "@" in email else ""
+    if domain not in domains:
+        raise HTTPException(
+            status_code=403,
+            detail=f"sign-in restricted to: {', '.join(sorted('@' + d for d in domains))}",
+        )
+
+
 @router.post("/request-password-reset")
 async def request_password_reset(body: EmailBody, request: Request):
+    _passwordless_only()
     # Open registration: create the user row on first sight so any new
     # email can complete the sign-up flow. The allowlist gate stays in
     # verify_jwt_token (chat / dev 403), it just doesn't gate sign-up.
@@ -90,6 +118,7 @@ async def request_password_reset(body: EmailBody, request: Request):
     # fix #1: cap sends per email and per source IP so this unauthenticated
     # endpoint can't be turned into a Resend-backed email bomb / cost sink.
     email = local_auth._normalize_email(body.email)
+    _allowlist_gate(email)
     ip = local_auth.client_ip(request)
     local_auth._rate_limit(f"resetemail:{email}", local_auth.RESET_EMAIL_MAX, local_auth.RESET_EMAIL_WINDOW)
     local_auth._rate_limit(f"resetip:{ip}", local_auth.RESET_IP_MAX, local_auth.RESET_IP_WINDOW)
@@ -106,8 +135,11 @@ async def request_password_reset(body: EmailBody, request: Request):
 
 @router.post("/reset-password")
 async def reset_password(body: ResetBody, request: Request, response: Response):
+    _passwordless_only()
+    _allowlist_gate(local_auth._normalize_email(body.email))
     if not local_auth.user_exists(body.email):
-        raise HTTPException(status_code=400, detail="invalid request")
+        # Same message as a bad code: don't confirm which emails exist.
+        raise HTTPException(status_code=400, detail="invalid or expired code")
     if not local_auth.consume_code(body.email, body.code, purpose="reset"):
         raise HTTPException(status_code=400, detail="invalid or expired code")
     local_auth.set_password(body.email, body.new_password)
@@ -195,9 +227,17 @@ async def login_with_code(body: CodeLoginBody, request: Request, response: Respo
 
 
 @router.post("/logout")
-async def logout(response: Response):
-    # Local logout: drop the cookie on this browser. Cheap and sufficient for
-    # the common case; does not invalidate the token server-side.
+async def logout(request: Request, response: Response):
+    # Drop the cookie AND revoke the token server-side, so a copied cookie
+    # does not stay valid for the rest of its 7-day TTL after logout.
+    try:
+        token = local_auth._extract_token(request)
+        claims = pyjwt.decode(token, options={"verify_signature": False})
+        jti = claims.get("jti")
+        if jti:
+            local_auth.terminate_session(str(jti))
+    except Exception:
+        pass
     local_auth.clear_auth_cookie(response)
     return {"message": "logged out"}
 
@@ -255,7 +295,9 @@ def _forgejo_username(email: str) -> str:
 
 
 @router.get("/forward")
-async def auth_forward(claims: dict = Depends(local_auth.require_local_user_open)):
+async def auth_forward(claims: dict = Depends(local_auth.require_local_user)):
+    # Strict dependency: the tenant SSO gate must apply the allowlist, not
+    # just signature validity.
     # Forward-auth endpoint for caddy -> Forgejo SSO (git.wizerith.ai).
     # require_local_user_open validates the .wizerith.ai cookie and raises 401
     # if it's missing/invalid (caddy turns that into a redirect to

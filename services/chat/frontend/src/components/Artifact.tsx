@@ -250,10 +250,20 @@ function runHandleForArtifact(artifact: ArtifactInfo): {
   source: "generated" | "attachment";
 } | null {
   const gen = artifact.url.match(/\/api\/sessions\/([^/]+)\/generated\/(.+)$/);
-  if (gen) return { sessionId: gen[1], filename: gen[2], source: "generated" };
+  if (gen) return { sessionId: gen[1], filename: safeDecode(gen[2]), source: "generated" };
   const att = artifact.url.match(/\/api\/sessions\/([^/]+)\/attachments\/(.+)$/);
-  if (att) return { sessionId: att[1], filename: att[2], source: "attachment" };
+  if (att) return { sessionId: att[1], filename: safeDecode(att[2]), source: "attachment" };
   return null;
+}
+
+// Artifact URLs carry a percent-encoded file name (spaces, parentheses,
+// Chinese titles). The Run handle and the IDE path need the real name.
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
 }
 
 function devHostFromCurrent(): string {
@@ -270,7 +280,7 @@ function workspacePathForArtifact(artifact: ArtifactInfo): string {
   // container — and the dev IDE mounts the same workspace, so this path
   // is reachable from the IDE side.
   const m = artifact.url.match(/\/api\/sessions\/([^/]+)\/generated\/(.+)$/);
-  if (m) return `/workspace/.artifacts/${m[1]}/${m[2]}`;
+  if (m) return `/workspace/.artifacts/${m[1]}/${safeDecode(m[2])}`;
   // Fallback for unknown URL shapes: hand the basename to the IDE and
   // let its openFile error out cleanly rather than guessing a path.
   return artifact.filename;

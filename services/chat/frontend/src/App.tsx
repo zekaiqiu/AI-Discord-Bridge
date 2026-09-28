@@ -593,6 +593,10 @@ export function App(): JSX.Element {
   // simultaneously (e.g. recovering A while sending in B) without
   // either one launching duplicate GET .../stream subscribers.
   const recoveryAttachedSidsRef = useRef<Set<string>>(new Set());
+  // Panes with a send in flight (from Enter until the POST is issued):
+  // a second Enter/click meanwhile used to create a second session and
+  // upload+send the same attachments twice.
+  const sendingPanesRef = useRef<Set<string>>(new Set());
   // Monotonic token bumped on every loadSession call. Stale getSession
   // responses (user clicked another session before this one returned)
   // are dropped instead of clobbering the latest view.
@@ -768,6 +772,9 @@ export function App(): JSX.Element {
       return;
     }
     (async () => {
+      // The bucket the boot fetch uses; admins are pinned to 'admin' below
+      // BEFORE sessions are fetched, or a non-admin closure value races it.
+      let bootWorkspace: Workspace = workspace;
       try {
         const meResp = await getMe();
         // Cross-site sign-in honor: if bet/market/dev bounced the browser
@@ -806,7 +813,8 @@ export function App(): JSX.Element {
         // value), pin to "admin" now so personal never even flashes. No-op in
         // the normal case where loadWorkspacePref already resolved "admin".
         if (meResp.role === "admin" && workspace !== "admin") {
-          void updateWorkspace("admin");
+          bootWorkspace = "admin";
+          await updateWorkspace("admin");
         }
         if (meResp.settings) {
           setSettings(meResp.settings);
@@ -830,7 +838,7 @@ export function App(): JSX.Element {
         setErrorBanner(formatError("Failed to load identity", err));
       }
       try {
-        const ss = await getSessions(workspace);
+        const ss = await getSessions(bootWorkspace);
         setSessions(ss);
         const url = new URL(window.location.href);
         const sParam = url.searchParams.get("s");
@@ -1092,23 +1100,40 @@ export function App(): JSX.Element {
         if (!stillStreaming) return;
         // The server answered and the turn is still running (typically the
         // backend restarted and is re-running it): re-attach to the live
-        // stream. GET .../stream replays the run's events then follows it;
-        // when no run exists it ends immediately and we fall back to polling.
+        // stream. GET .../stream replays the run's events FROM EVENT 0 and
+        // then follows it, so clear the locally accumulated partial first —
+        // otherwise the replay appends onto it and the bubble reads
+        // "Hello wor…Hello wor…" until done. Abortable via the owning
+        // controller so a pane close / session delete can stop it.
+        const owner = streamAbortsRef.current.get(sid);
+        if (owner?.signal.aborted) return;
+        updateMessages(sid, (prev) => {
+          const i = prev.length - 1;
+          if (i < 0 || prev[i].role !== "assistant" || prev[i].status !== "streaming") return prev;
+          const next = prev.slice();
+          next[i] = { ...next[i], content: "" };
+          return next;
+        });
         try {
-          await attachStream(sid, (evt) => handleStreamEventRef.current(sid, evt));
+          await attachStream(sid, (evt) => handleStreamEventRef.current(sid, evt), {
+            signal: owner?.signal,
+          });
           const after = await getSession(sid);
           replaceMessages(sid, after.messages || []);
           const tail = after.messages?.[after.messages.length - 1];
           if (!(tail && tail.role === "assistant" && tail.status === "streaming")) return;
-        } catch {
+        } catch (err) {
+          if ((err as { name?: string })?.name === "AbortError") return;
           /* attach failed — keep polling */
         }
-      } catch {
+      } catch (err) {
+        // The session is gone (deleted while we were polling): stop.
+        if (err instanceof ApiError && err.status === 404) return;
         /* single failed poll — try again */
       }
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     }
-  }, [replaceMessages]);
+  }, [replaceMessages, updateMessages]);
 
   // When the tab becomes visible again, re-sync the current session
   // messages from the server. Covers the case where the browser
@@ -1271,6 +1296,9 @@ export function App(): JSX.Element {
           // see the supposedly-stripped block. typeof "string" hits
           // both "" and "<actual text>" correctly.
           content: typeof evt.full_text === "string" ? evt.full_text : next[i].content,
+          // The bubble is terminal now; without this it kept status
+          // "streaming" (spinner / hidden footer) until the next resync.
+          status: evt.type === "done" ? "complete" : "cancelled",
           // Attach the per-turn metadata footer payload (timestamp /
           // model / tokens / tok_s) when the backend sent one. Left
           // untouched if absent so a re-attach replay can't clear it.
@@ -1311,6 +1339,7 @@ export function App(): JSX.Element {
         const next = prev.slice();
         next[i] = {
           ...next[i],
+          status: "error",
           content:
             (next[i].content || "") +
             `\n\n_⚠ generation failed: ${evt.message}_`,
@@ -1361,6 +1390,17 @@ export function App(): JSX.Element {
     streamAbortsRef.current.set(sid, ctrl);
     recoveryAttachedSidsRef.current.add(sid);
     setSessionStreaming(sid, true);
+    // Same settle handshake runTurn registers, so an interrupt-then-send
+    // against a re-attached turn (a wake, or a turn started elsewhere)
+    // waits for THIS attach to wind down instead of racing it.
+    let settleResolve: () => void = () => {};
+    const settleEntry = {
+      promise: new Promise<void>((res) => {
+        settleResolve = res;
+      }),
+      resolve: () => settleResolve(),
+    };
+    turnSettleRef.current.set(sid, settleEntry);
     (async () => {
       try {
         // Events apply to the per-session buffer regardless of which
@@ -1380,10 +1420,16 @@ export function App(): JSX.Element {
         try { await recoverFromStreamError(sid); } catch { /* ignore */ }
       } finally {
         recoveryAttachedSidsRef.current.delete(sid);
+        // Only clear what we own: if a replacement turn already took the
+        // slot, its streaming flag must survive our teardown.
         if (streamAbortsRef.current.get(sid) === ctrl) {
           streamAbortsRef.current.delete(sid);
+          setSessionStreaming(sid, false);
         }
-        setSessionStreaming(sid, false);
+        settleEntry.resolve();
+        if (turnSettleRef.current.get(sid) === settleEntry) {
+          turnSettleRef.current.delete(sid);
+        }
       }
     })();
   }, [handleStreamEvent, recoverFromStreamError, replaceMessages, setSessionStreaming]);
@@ -1933,8 +1979,26 @@ export function App(): JSX.Element {
       const hasAttachments =
         eph.pendingFiles.length > 0 || eph.pendingAttachments.length > 0;
       if (!trimmed && !hasAttachments) return;
+      if (sendingPanesRef.current.has(paneKey)) return;
+      sendingPanesRef.current.add(paneKey);
+      // The Composer clears its box synchronously on send; every early
+      // return below must hand the text back or it is silently lost.
+      const giveBack = (sid: string | null) => {
+        if (!trimmed) return;
+        if (sid) {
+          restoreDraft(sid, text);
+        } else {
+          const key = `pane:${paneKey}`;
+          const existing = getDraft(key);
+          if (!existing.includes(trimmed)) setDraft(key, existing ? `${text}\n\n${existing}` : text);
+        }
+      };
+      try {
       const sid = await ensureSessionForPane(paneKey);
-      if (!sid) return;
+      if (!sid) {
+        giveBack(null);
+        return;
+      }
       // Mid-stream submit (claude.ai-style): a turn is already streaming for
       // this session. Interrupt it and wait for it to wind down before we
       // append the new user turn, so the interrupted and new bubbles don't
@@ -1956,6 +2020,7 @@ export function App(): JSX.Element {
               `and all ${MAX_FILES_PER_TURN} attachment slots are full — ` +
               `remove an attachment or shorten the message.`,
           );
+          giveBack(sid);
           return;
         }
         const overflowName = "long-message.txt";
@@ -1974,6 +2039,7 @@ export function App(): JSX.Element {
           if (!handleAuthExpiry(err)) {
             setErrorBanner(formatError("Attachment upload failed", err));
           }
+          giveBack(sid);
           return;
         }
       }
@@ -2006,6 +2072,9 @@ export function App(): JSX.Element {
         imageGen: eph.imageGenOn,
         attachments,
       });
+      } finally {
+        sendingPanesRef.current.delete(paneKey);
+      }
     },
     [ensureSessionForPane, runTurn, interruptTurn, handleAuthExpiry],
   );

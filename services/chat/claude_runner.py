@@ -2049,6 +2049,9 @@ async def run_turn(
             dispatch=dispatch,
             container_name=container,
             claude_attach_dir=claude_attach_dir,
+            # Same identity directive as the primary attempt — without it the
+            # healed turn could surface the pooled account owner's name.
+            identity_prompt=build_identity_system_prompt(user_email),
         )
         async for ev in _stream_attempt(heal_args, allow_heal=False):
             yield ev

@@ -24,6 +24,7 @@ def _script(monkeypatch, steps: list[dict[str, Any]]):
             "tool_calls": step.get("tool_calls", []),
             "content": "".join(step.get("chunks", [])),
             "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            "finish_reason": step.get("finish", "tool_calls" if step.get("tool_calls") else "stop"),
         }
 
     async def fake_exec(container, command, *, workdir="/workspace", home="/workspace"):

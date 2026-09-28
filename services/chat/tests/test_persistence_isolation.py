@@ -46,7 +46,7 @@ def _stub_docker_exec(monkeypatch, tmp_path):
             self.stdout = out
             self.stderr = b""
 
-    def _fake_run(argv, *, input=None, capture_output=True, check=True):
+    def _fake_run(argv, *, input=None, capture_output=True, check=True, timeout=None):
         # `stat` returns "missing" so refresh_credentials_if_stale would
         # populate; populate_credentials needs a readable source file.
         if any(a == "stat" for a in argv) and "-c" in argv:
