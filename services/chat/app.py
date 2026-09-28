@@ -2009,6 +2009,68 @@ async def _title_task(
 # across turns, so a backgrounded task auto-surfaces and the agent reports back
 # with no new user message. Verified live against a real per-user container.
 # ===========================================================================
+def _is_api_model(model: str | None) -> bool:
+    """True for the OpenAI-compatible (stateless) runners: TokenHub glm/kimi,
+    haihub qwen/deepseek/minimax, the home-GPU local model."""
+    return bool(
+        local_runner.is_local_model(model)
+        or haihub_runner.is_haihub_model(model)
+        or tokenhub_runner.is_tokenhub_model(model)
+    )
+
+
+def _api_model_turn_gen(
+    *,
+    model: str,
+    user_text: str,
+    role: str | None,
+    container: str | None,
+    session_id: str,
+    prior_history: str | None,
+    persona: str | None,
+    memory: str | None,
+    output_language: str,
+    effort: str | None,
+) -> AsyncIterator[dict[str, Any]]:
+    """One turn on a stateless API model, with the same tool/artifact
+    dispatch for user turns AND scheduled wakes.
+
+    Tools (run_bash) target the session's per-user container when it has
+    one; admin sessions have none, so their tools run in the tenant
+    host-shell container instead (parity with the claude path's "host"
+    dispatch: HOME=/home/felix, artifacts in the tenant host dir that maps
+    chat-side to /data/generated/<sid>).
+    """
+    runner = (
+        local_runner if local_runner.is_local_model(model)
+        else tokenhub_runner if tokenhub_runner.is_tokenhub_model(model)
+        else haihub_runner
+    )
+    tool_container = container
+    tool_workdir = "/workspace"
+    tool_home = "/workspace"
+    tool_artifacts: str | None = None
+    if not tool_container and role == "admin":
+        tool_container = claude_runner.host_shell_container()
+        tool_workdir = "/home/felix"
+        tool_home = "/home/felix"
+        tool_artifacts = claude_runner.artifacts_path_for("host", session_id)
+    return runner.run_turn(
+        prompt=user_text,
+        model=model,
+        prior_history=prior_history,
+        persona=persona,
+        memory=memory,
+        output_language=output_language,
+        container=tool_container,
+        chat_session_id=session_id,
+        effort=effort,
+        tool_workdir=tool_workdir,
+        tool_home=tool_home,
+        artifacts_path=tool_artifacts,
+    )
+
+
 def _persistent_enabled() -> bool:
     """A1 persistent sessions on? Default ON; ``CHAT_PERSISTENT_SESSIONS=0``
     disables. Read per-call so conftest/tests can gate it without import-order
@@ -2355,7 +2417,14 @@ async def _fire_schedule_locked(rec: dict[str, Any]) -> None:
         return
     session = storage.get_session(email, session_id)
     if session is None:
-        logger.info("scheduled wake %s: session gone, dropping", sched_id)
+        # The thread was deleted after the wake was armed. A recurring wake
+        # would otherwise re-arm forever (claim_due bumps next_fire on every
+        # fire), so remove the record instead of just dropping this firing.
+        logger.warning("scheduled wake %s: session gone, cancelling", sched_id)
+        try:
+            chat_scheduler.cancel(email, sched_id)
+        except Exception:
+            logger.exception("scheduled wake %s: cancel failed", sched_id)
         return
     key = (email, session_id)
     lock = storage.get_session_lock(email, session_id)
@@ -2395,6 +2464,7 @@ async def _fire_schedule_locked(rec: dict[str, Any]) -> None:
             )
         except Exception:
             logger.exception("scheduled wake: ensure_artifacts_dir failed for %s", session_id)
+        _settings_blob: dict[str, Any] = {}
         try:
             _settings_blob = storage.get_settings(email)
             persona = _settings_blob.get("persona") or None
@@ -2406,6 +2476,14 @@ async def _fire_schedule_locked(rec: dict[str, Any]) -> None:
         except Exception:
             memory = ""
         artifacts_path = claude_runner.artifacts_path_for(dispatch, session_id)
+        # A wake has no per-message model pick, so it runs on the user's
+        # default model — the same one a fresh tab would send. Before this,
+        # wakes always went to the claude CLI even when the lineup default is
+        # a TokenHub/haihub model, which (with the pool accounts dead) made
+        # every wake error out.
+        wake_model = _normalize_model(
+            _settings_blob.get("default_model") if isinstance(_settings_blob, dict) else None
+        )
         recurring = bool(rec.get("interval_seconds"))
         wake_text = (
             "[Scheduled wake — this turn was triggered by a timer you set "
@@ -2467,6 +2545,23 @@ async def _fire_schedule_locked(rec: dict[str, Any]) -> None:
                 proc = await _session_mgr.get_or_create(key, lambda: (argv, env), _on_auto_turn)
                 user_turn = await proc.send_user(effective_prompt)
                 gen = claude_runner.normalize_session_turn(user_turn, model=None)
+            elif _is_api_model(wake_model):
+                # Stateless API model: same dispatch as a typed turn, with the
+                # thread's transcript (everything before the placeholder we
+                # just appended) as history so the wake knows what it is
+                # following up on.
+                gen = _api_model_turn_gen(
+                    model=wake_model,
+                    user_text=wake_text,
+                    role=role,
+                    container=container,
+                    session_id=session_id,
+                    prior_history=_stateless_history(session.get("messages") or []),
+                    persona=persona,
+                    memory=memory,
+                    output_language=output_language,
+                    effort=None,
+                )
             else:
                 # Per-turn path: run_turn wraps the raw instruction with the
                 # artifacts/persona/memory blocks itself and --resumes the
@@ -2695,39 +2790,20 @@ async def _run_turn_worker(
     turn_start_ts = time.time()
 
     try:
-        if (
-            local_runner.is_local_model(model)
-            or haihub_runner.is_haihub_model(model)
-            or tokenhub_runner.is_tokenhub_model(model)
-        ):
+        if _is_api_model(model):
             # Non-Claude OpenAI-compatible models: the TokenHub-hosted
             # glm-5.3 / kimi-k3, the haihub-hosted qwen/deepseek/minimax and
             # the home-GPU "gemma4-local" (LM Studio). These do NOT use the
             # claude CLI / persistent-session path; they stream via their own
             # runner with the SAME normalized event contract the consume
-            # loop below expects. Tools (run_bash) target the session's
-            # per-user container when it has one; admin sessions have none,
-            # so their tools run in the tenant host-shell container instead —
-            # parity with the claude path's "host" dispatch (same container,
-            # HOME=/home/felix, artifacts in the tenant host dir that maps
-            # chat-side to /data/generated/<sid>).
-            runner = (
-                local_runner if local_runner.is_local_model(model)
-                else tokenhub_runner if tokenhub_runner.is_tokenhub_model(model)
-                else haihub_runner
-            )
-            tool_container = container
-            tool_workdir = "/workspace"
-            tool_home = "/workspace"
-            tool_artifacts: str | None = None
-            if not tool_container and role == "admin":
-                tool_container = claude_runner.host_shell_container()
-                tool_workdir = "/home/felix"
-                tool_home = "/home/felix"
-                tool_artifacts = claude_runner.artifacts_path_for("host", session_id)
-            gen = runner.run_turn(
-                prompt=user_text,
+            # loop below expects. Being stateless they get this session's
+            # full prior transcript every turn (stateless_history).
+            gen = _api_model_turn_gen(
                 model=model,
+                user_text=user_text,
+                role=role,
+                container=container,
+                session_id=session_id,
                 prior_history=(
                     stateless_history if stateless_history is not None
                     else prior_history
@@ -2735,12 +2811,7 @@ async def _run_turn_worker(
                 persona=persona,
                 memory=memory,
                 output_language=output_language,
-                container=tool_container,
-                chat_session_id=session_id,
                 effort=effort,
-                tool_workdir=tool_workdir,
-                tool_home=tool_home,
-                artifacts_path=tool_artifacts,
             )
         elif _persistent_enabled():
             # A1: route the user turn through the session's long-lived
