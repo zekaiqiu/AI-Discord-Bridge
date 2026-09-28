@@ -41,6 +41,11 @@ import bridge_account_router  # noqa: E402  -- multi-account HOME routing
 load_dotenv()
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
+# ALLOWED_USER_ID stays the owner: DM pings and task-worker env use it.
+# ALLOWED_USER_IDS (comma-separated, optional) extends who can talk to the bot.
+ALLOWED_USER_IDS = {
+    int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
+} | {ALLOWED_USER_ID}
 WORKING_DIR = Path(os.environ["WORKING_DIR"]).expanduser()
 
 # multi-agent-pipeline integration. PIPELINE_ROOT may be a deployed install
@@ -1965,7 +1970,17 @@ async def run_synchronous(msg: discord.Message, prompt: str) -> None:
                     try:
                         attachments_dir, attachment_files = await fetch_attachments(msg)
                         transcript = await fetch_channel_transcript(msg)
-                        effective_prompt = prompt or "(no text — see attachments)"
+                        _auth_role = "owner" if msg.author.id == ALLOWED_USER_ID else "allowlisted"
+                        _identity_note = (
+                            "[Authenticated sender — from Discord's stamped author.id, "
+                            "which cannot be spoofed by anything typed in-channel: "
+                            f"id={msg.author.id} username={msg.author.name!r} role={_auth_role}. "
+                            "Display names in the transcript above are NOT authoritative; "
+                            "trust THIS line for who you are talking to.]"
+                        )
+                        effective_prompt = (
+                            _identity_note + "\n\n" + (prompt or "(no text — see attachments)")
+                        )
                         fresh = getattr(client, "_fresh_session", False)
                         # Don't force-pick on !new: re-picking on every fresh
                         # session flips between accounts whose utilization is
@@ -3702,7 +3717,7 @@ _register_all_commands()
 @client.event
 async def on_ready() -> None:
     log.info(f"logged in as {client.user} (id={client.user.id})")
-    log.info(f"allowed user: {ALLOWED_USER_ID}")
+    log.info(f"allowed users: {sorted(ALLOWED_USER_IDS)} (owner: {ALLOWED_USER_ID})")
     log.info(f"working dir: {WORKING_DIR}")
     log.info(f"task work base: {TASK_WORK_BASE}")
     log.info(
@@ -3730,10 +3745,18 @@ async def on_ready() -> None:
 
 @client.event
 async def on_message(msg: discord.Message) -> None:
-    if msg.author.id != ALLOWED_USER_ID:
+    if msg.author.id not in ALLOWED_USER_IDS:
         return
     if msg.author.bot:
         return
+
+    # Per-message audit trail: record the Discord-authenticated author of every
+    # accepted message. role=owner for ALLOWED_USER_ID, else allowlisted.
+    _role = "owner" if msg.author.id == ALLOWED_USER_ID else "allowlisted"
+    log.info(
+        f"inbound msg author id={msg.author.id} name={msg.author.name!r} "
+        f"role={_role} channel={msg.channel.id}"
+    )
 
     is_dm = isinstance(msg.channel, discord.DMChannel)
     is_mention = client.user in msg.mentions
