@@ -185,6 +185,7 @@ export function SettingsDashboard({
                 >
                   <option value="glm">{t("settings.model.glm")}</option>
                   <option value="kimi">{t("settings.model.kimi")}</option>
+                  <option value="mimo">{t("settings.model.mimo")}</option>
                   <option value="qwen">{t("settings.model.qwen")}</option>
                   <option value="deepseek">{t("settings.model.deepseek")}</option>
                   <option value="minimax">{t("settings.model.minimax")}</option>

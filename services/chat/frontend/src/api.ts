@@ -60,6 +60,7 @@ export type ModelChoice =
   | "default"
   | "glm"
   | "kimi"
+  | "mimo"
   | "qwen"
   | "deepseek"
   | "minimax"
@@ -69,6 +70,7 @@ export const MODEL_LABELS: Record<ModelChoice, string> = {
   default: "Auto",
   glm: "GLM-5.3",
   kimi: "Kimi K3",
+  mimo: "MiMo V2.6 Pro",
   qwen: "Qwen3.5 397B",
   deepseek: "DeepSeek V4",
   minimax: "MiniMax M2.7",

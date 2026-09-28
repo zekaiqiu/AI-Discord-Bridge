@@ -204,7 +204,7 @@ def _session_path(email: str, session_id: str) -> str:
 SETTINGS_FILENAME = "_settings.json"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "default_model": "glm",           # glm | kimi | qwen | deepseek | minimax | gemma4-local
+    "default_model": "glm",           # glm | kimi | mimo | qwen | deepseek | minimax | gemma4-local
     "send_on_enter": True,            # if False, Enter inserts newline; Cmd/Ctrl+Enter sends
     "persona": "",                    # personal system-prompt prefix, prepended to every turn
     "notify_on_complete": False,      # browser desktop notification when a turn ends
@@ -218,14 +218,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # to seed both ui_language and output_language. Don't add it to defaults.
 }
 
-# TokenHub aliases (tokenhub_runner._TOKENHUB_MODELS) + haihub model aliases
+# TokenHub aliases (tokenhub_runner._TOKENHUB_MODELS) + Xiaomi MiMo alias
+# (mimo_runner._MIMO_MODELS) + haihub model aliases
 # (haihub_runner._HAIHUB_MODELS) + local home-GPU alias
 # (local_runner._LOCAL_MODELS). Lineup since 2026-09-28: TokenHub glm/kimi lead the picker and the
 # Anthropic/claude aliases (incl. "default", which meant "claude picks")
 # were removed from chat.wizerith.ai. Saved blobs still carrying an old
 # value (opus5 / default / ...) fail this membership test on the next read
 # and fall back to DEFAULT_SETTINGS — a free migration to glm.
-_VALID_MODELS = {"glm", "kimi", "qwen", "deepseek", "minimax", "gemma4-local"}
+_VALID_MODELS = {"glm", "kimi", "mimo", "qwen", "deepseek", "minimax", "gemma4-local"}
 _VALID_THEMES = {"dark", "light", "system"}
 # Site-wide display language is English + Simplified/Traditional Chinese only.
 # Legacy "de"/"tl" values no longer validate, so any saved blob carrying them

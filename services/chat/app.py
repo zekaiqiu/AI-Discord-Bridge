@@ -56,6 +56,7 @@ import haihub_runner
 import image_gen
 import local_runner
 import tokenhub_runner
+import mimo_runner
 import storage
 import user_container
 from session_process import SessionProcessManager
@@ -172,7 +173,7 @@ class RenameSessionBody(BaseModel):
 # ---------------------------------------------------------------------------
 CHAT_DEFAULT_MODEL = os.environ.get("CHAT_DEFAULT_MODEL", "").strip()
 NON_CLAUDE_MODELS = frozenset({
-    "glm", "kimi", "qwen", "deepseek", "minimax", "gemma4-local",
+    "glm", "kimi", "mimo", "qwen", "deepseek", "minimax", "gemma4-local",
 })
 
 
@@ -193,7 +194,8 @@ def _normalize_model(model: str | None) -> str | None:
 # DeepSeek, Qwen and MiniMax reject unsupported values (so an invalid
 # stored/POSTed level must never reach the payload), while Kimi's gateway
 # accepts any string (its set is the conservative subset). Models without
-# an entry (gemma4-local; claude aliases in legacy mode) offer no effort
+# an entry (mimo — levels not yet probed, no key on the host as of
+# 2026-09-28; gemma4-local; claude aliases in legacy mode) offer no effort
 # control — the frontend hides the selector and the backend drops the
 # value.
 EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
@@ -2269,11 +2271,12 @@ async def _title_task(
 # ===========================================================================
 def _is_api_model(model: str | None) -> bool:
     """True for the OpenAI-compatible (stateless) runners: TokenHub glm/kimi,
-    haihub qwen/deepseek/minimax, the home-GPU local model."""
+    Xiaomi mimo, haihub qwen/deepseek/minimax, the home-GPU local model."""
     return bool(
         local_runner.is_local_model(model)
         or haihub_runner.is_haihub_model(model)
         or tokenhub_runner.is_tokenhub_model(model)
+        or mimo_runner.is_mimo_model(model)
     )
 
 
@@ -2332,6 +2335,7 @@ async def _api_model_turn_gen(
     runner = (
         local_runner if local_runner.is_local_model(model)
         else tokenhub_runner if tokenhub_runner.is_tokenhub_model(model)
+        else mimo_runner if mimo_runner.is_mimo_model(model)
         else haihub_runner
     )
     tool_container = container

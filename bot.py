@@ -367,11 +367,15 @@ def should_ping_now(record: dict, now: float) -> bool:
 # BRIDGE_MODEL_FILE and shown in `!model`.
 # provider="tokenhub" → same host-tool loop against Tencent TokenHub's
 # OpenAI-compatible Token Plan endpoint (api_model is the TokenHub model id).
+# provider="mimo" → same loop against Xiaomi's MiMo OpenAI-compatible API
+# (MIMO_BASE_URL; key from MIMO_API_KEY or ~/.mimo_key).
 AVAILABLE_MODELS: list[dict] = [
     {"label": "Kimi K3",           "provider": "tokenhub",  "id": "kimi-k3",  "api_model": "kimi-k3",
      "effort": ["low", "medium", "high", "max"]},
     {"label": "GLM-5.3",           "provider": "tokenhub",  "id": "glm-5.3",  "api_model": "glm-5.3",
      "effort": ["low", "high", "max"]},
+    {"label": "MiMo V2.6 Pro",     "provider": "mimo",      "id": "mimo-v2.6-pro", "api_model": "mimo-v2.6-pro",
+     "effort": None},
     {"label": "Fable 5.1",         "provider": "anthropic", "id": "claude-fable-5-1",          "betas": None,
      "effort": ["low", "medium", "high", "xhigh", "max"]},
     {"label": "Opus 5.5",          "provider": "anthropic", "id": "claude-opus-5-5",           "betas": None,
@@ -400,6 +404,8 @@ AVAILABLE_MODELS: list[dict] = [
 # 2026-09-28: GLM-5.3 always thinks and only takes low/high/max; Qwen and
 # MiniMax reject max/xhigh; DeepSeek validates none/low/medium/high/max;
 # Kimi's gateway accepts any string, so its list is the conservative set.
+# MiMo V2.6 Pro: effort levels not probed yet (no key on the host as of
+# 2026-09-28) → None until verified; the provider default applies.
 # Unset (`!effort reset`) → no flag/field is sent and the provider default
 # applies.
 DEFAULT_MODEL_ID = "claude-fable-5-1"
@@ -496,6 +502,26 @@ _TOKENHUB_KEY_FILE = Path(os.environ.get(
 ))
 
 
+_MIMO_BASE_URL = os.environ.get(
+    "MIMO_BASE_URL", "https://api.xiaomimimo.com/v1"
+).rstrip("/")
+_MIMO_KEY_FILE = Path(os.environ.get(
+    "MIMO_KEY_FILE", str(Path.home() / ".mimo_key")
+))
+
+
+def _resolve_mimo_key() -> str | None:
+    """Xiaomi MiMo API key: MIMO_API_KEY env, else the 0600 key file
+    (~/.mimo_key). Read per turn so adding/rotating it needs no restart."""
+    key = os.environ.get("MIMO_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return _MIMO_KEY_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 def _resolve_tokenhub_key() -> str | None:
     """TokenHub API key: TOKENHUB_API_KEY env, else the 0600 key file
     (~/.glm_key). Read per turn so a rotated key needs no restart."""
@@ -519,6 +545,11 @@ _OPENAI_PROVIDERS: dict[str, dict] = {
         "base_url": _TOKENHUB_BASE_URL,
         "key": _resolve_tokenhub_key,
         "missing": "no TokenHub key (TOKENHUB_API_KEY or ~/.glm_key)",
+    },
+    "mimo": {
+        "base_url": _MIMO_BASE_URL,
+        "key": _resolve_mimo_key,
+        "missing": "no MiMo key (MIMO_API_KEY or ~/.mimo_key) — MiMo V2.6 Pro is not configured yet",
     },
 }
 _QWEN_MAX_TOKENS = 8192
@@ -796,9 +827,9 @@ async def _run_haihub(
                         for i, tc in enumerate(tool_calls)
                     ],
                 }
-                # Thinking models on TokenHub (Kimi) expect their reasoning
-                # echoed back on tool-call turns.
-                if provider == "tokenhub" and reasoning_parts:
+                # Thinking models on TokenHub (Kimi) and Xiaomi MiMo expect
+                # their reasoning echoed back on tool-call turns.
+                if provider in ("tokenhub", "mimo") and reasoning_parts:
                     assistant_msg["reasoning_content"] = "".join(reasoning_parts)
                 messages.append(assistant_msg)
                 for i, tc in enumerate(tool_calls):
@@ -3548,6 +3579,7 @@ async def handle_model(msg: discord.Message, args: str) -> None:
             tag = {
                 "anthropic": " _(Anthropic)_",
                 "tokenhub": " _(TokenHub API, host tools)_",
+                "mimo": " _(Xiaomi MiMo API, host tools)_",
             }.get(m["provider"], " _(haihub API, host tools)_")
             lines.append(f"{i}. **{m['label']}** (`{m['id']}`){tag}{mark}")
         lines.append("\nSet with `!model set <number>`.")

@@ -223,6 +223,7 @@ MODEL_IDENTITY: dict[str, tuple[str, str, str]] = {
     # reference them but are no longer offered on the wizerith picker.
     "glm": ("GLM-5.3", "glm-5.3", "Z.ai"),
     "kimi": ("Kimi K3", "kimi-k3", "Moonshot AI"),
+    "mimo": ("MiMo V2.6 Pro", "mimo-v2.6-pro", "Xiaomi"),
     "opus": ("Claude Opus 4.8", "claude-opus-4-8", "Anthropic"),
     "sonnet": ("Claude Sonnet 4.6", "claude-sonnet-4-6", "Anthropic"),
     "haiku": ("Claude Haiku 4.5", "claude-haiku-4-5", "Anthropic"),

@@ -763,7 +763,7 @@ export function Composer(props: ComposerProps): JSX.Element {
               aria-label={t("composer.pill.model_aria")}
               title={t("composer.pill.model_title")}
             >
-              {(["glm", "kimi", "qwen", "deepseek", "minimax", "gemma4-local"] as ModelChoice[]).map((m) => (
+              {(["glm", "kimi", "mimo", "qwen", "deepseek", "minimax", "gemma4-local"] as ModelChoice[]).map((m) => (
                 <option key={m} value={m}>
                   {MODEL_LABELS[m]}
                 </option>
