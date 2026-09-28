@@ -566,6 +566,30 @@ def _format_prior_history(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
+# Stateless (OpenAI-compatible) runners get the session's own transcript on
+# EVERY turn — haihub/tokenhub/local have no server-side session to --resume,
+# so without this turn 2+ has no memory of turn 1 (see
+# tests/test_api_history_continuity.py). Capped so a very long thread can't
+# blow the provider's context window: keep the most recent tail.
+_STATELESS_HISTORY_MAX_CHARS = int(
+    os.environ.get("CHAT_STATELESS_HISTORY_MAX_CHARS", "120000")
+)
+
+
+def _stateless_history(messages: list[dict[str, Any]]) -> str | None:
+    """Full prior transcript for a stateless runner, or None when empty."""
+    text = _format_prior_history(messages)
+    if not text:
+        return None
+    if len(text) > _STATELESS_HISTORY_MAX_CHARS:
+        text = (
+            "[Earlier history truncated — only the most recent part of this "
+            "conversation is shown.]\n\n"
+            + text[-_STATELESS_HISTORY_MAX_CHARS:]
+        )
+    return text
+
+
 def _sse_event(event_type: str, payload: dict[str, Any]) -> bytes:
     """Format one SSE frame.
 
@@ -2538,8 +2562,15 @@ async def _run_turn_worker(
     model: str | None = None,
     effort: str | None = None,
     prior_history: str | None = None,
+    stateless_history: str | None = None,
 ) -> None:
     """Drive one agent turn to terminal. NEVER raises; always finalises run.
+
+    ``prior_history`` is the fork-first-turn preamble (claude CLI path only —
+    ordinary turns there ``--resume`` and must NOT get a transcript replay).
+    ``stateless_history`` is this session's full prior transcript, used by
+    the OpenAI-compatible runners on every turn because they hold no
+    server-side session state.
 
     Contract:
       * On entry the worker already holds ``lock`` (acquired by
@@ -2697,7 +2728,10 @@ async def _run_turn_worker(
             gen = runner.run_turn(
                 prompt=user_text,
                 model=model,
-                prior_history=prior_history,
+                prior_history=(
+                    stateless_history if stateless_history is not None
+                    else prior_history
+                ),
                 persona=persona,
                 memory=memory,
                 output_language=output_language,
@@ -3555,9 +3589,14 @@ async def post_message(
     # session["messages"] now includes the just-appended user msg +
     # placeholder; we slice off everything before those.
     prior_history: str | None = None
-    if is_first_turn and prior_messages_count > 0:
+    stateless_history: str | None = None
+    if prior_messages_count > 0:
         prior = (session.get("messages") or [])[:prior_messages_count]
-        prior_history = _format_prior_history(prior)
+        # Stateless runners (glm/kimi/qwen/...) need the whole transcript on
+        # every turn; the claude path only wants it on a fork's first turn.
+        stateless_history = _stateless_history(prior)
+        if is_first_turn:
+            prior_history = _format_prior_history(prior)
 
     # Spawn the worker. From this point onward the run is "live".
     if user_mode == "image":
@@ -3584,6 +3623,7 @@ async def post_message(
                 model=user_model,
                 effort=user_effort,
                 prior_history=prior_history,
+                stateless_history=stateless_history,
             )
         )
     _active_tasks[key] = task
