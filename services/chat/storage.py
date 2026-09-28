@@ -1132,8 +1132,65 @@ def set_title(
     return data
 
 
-def sweep_stale_streaming_messages() -> int:
-    """Flip every assistant message stuck at status='streaming' → 'error'.
+def find_streaming_placeholders() -> list[dict[str, Any]]:
+    """Every assistant message still at status='streaming' across the store.
+
+    Each record carries what boot-time recovery needs to decide between
+    re-running the turn and writing it off:
+      ``recoverable`` — the placeholder is the LAST message of its thread,
+      the message before it is a non-empty user message, and it is not a
+      scheduled wake (wakes re-fire from the scheduler's lease on their own).
+      ``user_text`` — that user message's content (None when not recoverable).
+    """
+    root = _sessions_root()
+    out: list[dict[str, Any]] = []
+    if not os.path.isdir(root):
+        return out
+    for user_slug in os.listdir(root):
+        user_dir = os.path.join(root, user_slug)
+        if not os.path.isdir(user_dir):
+            continue
+        for entry in os.listdir(user_dir):
+            if not entry.endswith(".json") or entry.startswith("_"):
+                continue
+            try:
+                data = _read_session_file(os.path.join(user_dir, entry))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            msgs = data.get("messages")
+            if not isinstance(msgs, list):
+                continue
+            for i, m in enumerate(msgs):
+                if not isinstance(m, dict) or m.get("role") != "assistant":
+                    continue
+                if m.get("status") != ASSISTANT_STATUS_STREAMING:
+                    continue
+                prev = msgs[i - 1] if i > 0 and isinstance(msgs[i - 1], dict) else None
+                user_text = prev.get("content") if prev and prev.get("role") == "user" else None
+                recoverable = bool(
+                    i == len(msgs) - 1
+                    and isinstance(user_text, str) and user_text.strip()
+                    and not m.get("via")
+                )
+                out.append({
+                    "email": data.get("email") or "",
+                    "session_id": data.get("id") or entry[:-5],
+                    "seq": m.get("seq"),
+                    "via": m.get("via"),
+                    "recoverable": recoverable,
+                    "user_text": user_text if recoverable else None,
+                })
+    return out
+
+
+def sweep_stale_streaming_messages(
+    keep: "frozenset[tuple[str, str, Any]] | set[tuple[str, str, Any]] | None" = None,
+) -> int:
+    """Flip every assistant message stuck at status='streaming' → 'error',
+    except the ``(email, session_id, seq)`` keys in ``keep`` — those are the
+    placeholders boot-time recovery is about to re-run on the same seq.
 
     Called once on app startup. The worker normally persists a terminal
     status (complete / error / cancelled) inside try/except — so the
@@ -1176,6 +1233,10 @@ def sweep_stale_streaming_messages() -> int:
                 if m.get("role") != "assistant":
                     continue
                 if m.get("status") != ASSISTANT_STATUS_STREAMING:
+                    continue
+                if keep and (
+                    (data.get("email") or "", data.get("id") or entry[:-5], m.get("seq")) in keep
+                ):
                     continue
                 m["status"] = ASSISTANT_STATUS_ERROR
                 # Append a note to the partial content so the user sees
@@ -1233,6 +1294,7 @@ __all__ = [
     "ASSISTANT_STATUS_ERROR",
     "ASSISTANT_STATUS_STREAMING",
     "sweep_stale_streaming_messages",
+    "find_streaming_placeholders",
     "append_assistant_placeholder",
     "append_messages",
     "append_user_message",

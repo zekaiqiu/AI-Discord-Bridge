@@ -1066,9 +1066,17 @@ export function App(): JSX.Element {
   // for the server to finalize. Without the await, `streaming` flips
   // off immediately on the catch path and the user sees an empty
   // bubble even though the model is still generating.
+  // Late-bound handle on handleStreamEvent (defined further down) so the
+  // recovery loop can re-attach to a run the backend re-created after a
+  // restart and stream its deltas live instead of only polling snapshots.
+  const handleStreamEventRef = useRef<(sid: string, evt: StreamEvent) => void>(() => {});
+
   const recoverFromStreamError = useCallback(async (sid: string): Promise<void> => {
     const POLL_INTERVAL_MS = 2000;
-    const POLL_DEADLINE_MS = 120_000;
+    // A backend restart re-runs the interrupted turn on the same bubble; that
+    // re-run can take minutes, so keep following it rather than giving up
+    // after two minutes and leaving a stale spinner.
+    const POLL_DEADLINE_MS = 900_000;
     const deadline = Date.now() + POLL_DEADLINE_MS;
     while (Date.now() < deadline) {
       try {
@@ -1082,6 +1090,19 @@ export function App(): JSX.Element {
         const stillStreaming =
           !!last && last.role === "assistant" && last.status === "streaming";
         if (!stillStreaming) return;
+        // The server answered and the turn is still running (typically the
+        // backend restarted and is re-running it): re-attach to the live
+        // stream. GET .../stream replays the run's events then follows it;
+        // when no run exists it ends immediately and we fall back to polling.
+        try {
+          await attachStream(sid, (evt) => handleStreamEventRef.current(sid, evt));
+          const after = await getSession(sid);
+          replaceMessages(sid, after.messages || []);
+          const tail = after.messages?.[after.messages.length - 1];
+          if (!(tail && tail.role === "assistant" && tail.status === "streaming")) return;
+        } catch {
+          /* attach failed — keep polling */
+        }
       } catch {
         /* single failed poll — try again */
       }
@@ -1322,6 +1343,10 @@ export function App(): JSX.Element {
   // (not partials), so polling getSession would show an empty bubble
   // until done — the SSE replay is what lets the user see all the
   // progress that accumulated while they were on another session.
+  useEffect(() => {
+    handleStreamEventRef.current = handleStreamEvent;
+  }, [handleStreamEvent]);
+
   const tryAttachIfStreaming = useCallback((sid: string, msgs: Message[]): void => {
     if (!sid) return;
     // A live POST stream (started in onSend) is its own subscriber to

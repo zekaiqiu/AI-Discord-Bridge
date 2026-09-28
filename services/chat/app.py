@@ -665,9 +665,142 @@ async def _start_eviction_task() -> None:
     _eviction_task = asyncio.create_task(_eviction_loop())
 
 
+# Set by the FIRST shutdown hook. A worker whose task is cancelled while this
+# is True is dying with the process, not by user request: it must leave its
+# placeholder at status='streaming' (and its uploads on disk) so the next boot
+# re-runs the turn instead of writing it off as cancelled.
+_shutting_down = False
+
+
+@app.on_event("shutdown")
+async def _flag_shutdown() -> None:
+    global _shutting_down
+    _shutting_down = True
+
+
+_RECOVERY_NOTE = (
+    "\n\n[System note: the backend restarted while answering this message, so "
+    "this turn is being re-run automatically. Files or work from the first "
+    "attempt may already exist in the workspace — check before redoing it.]"
+)
+
+
+async def _recover_turn(rec: dict[str, Any]) -> bool:
+    """Re-run one interrupted turn on its existing assistant placeholder.
+
+    Mirrors post_message's spawn: take the session lock, register a TurnRun
+    under the SAME assistant seq (so the client's bubble fills in and a GET
+    .../stream re-attaches to it), and hand off to _run_turn_worker with the
+    user's default model. Returns True if a worker was spawned.
+    """
+    email, session_id, seq = rec["email"], rec["session_id"], rec["seq"]
+    session = storage.get_session(email, session_id)
+    if session is None or not isinstance(seq, int):
+        return False
+    msgs = session.get("messages") or []
+    if not msgs or msgs[-1].get("seq") != seq or msgs[-1].get("status") != storage.ASSISTANT_STATUS_STREAMING:
+        return False
+    key = (email, session_id)
+    lock = storage.get_session_lock(email, session_id)
+    await lock.acquire()
+    if key in _active_runs:
+        lock.release()
+        return False
+    prior = [m for m in msgs[:-2]]
+    try:
+        _settings_blob = storage.get_settings(email)
+    except Exception:
+        _settings_blob = {}
+    if not isinstance(_settings_blob, dict):
+        _settings_blob = {}
+    model = _normalize_model(_settings_blob.get("default_model"))
+    is_first_turn = not session.get("claude_initialized")
+    if is_first_turn:
+        try:
+            storage.mark_claude_initialized(email, session_id)
+        except Exception:
+            pass
+    prior_history = _format_prior_history(prior) if (is_first_turn and prior) else None
+    run = _TurnRun(email=email, session_id=session_id, assistant_seq=seq)
+    _active_runs[key] = run
+    task = asyncio.create_task(
+        _run_turn_worker(
+            run=run,
+            user_text=str(rec["user_text"]) + _RECOVERY_NOTE,
+            claude_session_id=session["claude_session_id"],
+            account=session.get("account"),
+            role=session.get("role"),
+            container=session.get("container"),
+            is_first_turn=is_first_turn,
+            title_was_empty=not session.get("title"),
+            lock=lock,
+            model=model,
+            effort=None,
+            prior_history=prior_history,
+            stateless_history=_stateless_history(prior),
+        )
+    )
+    _active_tasks[key] = task
+
+    def _cleanup(_t: asyncio.Task[None], _k: tuple[str, str] = key) -> None:
+        _active_runs.pop(_k, None)
+        _active_tasks.pop(_k, None)
+
+    task.add_done_callback(_cleanup)
+    logger.warning(
+        "restart recovery: re-running interrupted turn %s seq=%s on model=%s",
+        session_id, seq, model,
+    )
+    return True
+
+
+async def _recover_interrupted_turns() -> tuple[int, int]:
+    """Boot-time handling of assistant messages left at status='streaming'.
+
+    A backend restart (deploy, crash, OOM) kills every in-flight turn. The
+    user's message is already persisted, so a turn whose placeholder is the
+    last message of its thread is simply re-run on the same bubble; anything
+    else (a wake — the scheduler's lease re-fires it — or a placeholder that
+    is no longer the tail) is flipped to error with a restart notice so the
+    spinner clears. Returns (recovered, swept).
+    """
+    try:
+        found = await asyncio.to_thread(storage.find_streaming_placeholders)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("restart recovery: scan failed: %r", exc)
+        return (0, 0)
+    keep = {
+        (r["email"], r["session_id"], r["seq"]) for r in found if r["recoverable"]
+    }
+    try:
+        swept = await asyncio.to_thread(storage.sweep_stale_streaming_messages, keep)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stale-streaming sweep failed at boot: %r", exc)
+        swept = 0
+    recovered = 0
+    for rec in found:
+        if not rec["recoverable"]:
+            continue
+        try:
+            if await _recover_turn(rec):
+                recovered += 1
+        except Exception:
+            logger.exception(
+                "restart recovery failed for %s seq=%s", rec["session_id"], rec["seq"],
+            )
+    if recovered or swept:
+        logger.warning(
+            "restart recovery: re-ran %d interrupted turn(s), swept %d → error",
+            recovered, swept,
+        )
+    return (recovered, swept)
+
+
 @app.on_event("startup")
 async def _sweep_stale_streaming() -> None:
-    """Boot-time cleanup of assistant messages stuck at status='streaming'.
+    """Boot-time handling of assistant messages stuck at status='streaming':
+    re-run the ones that can be (see _recover_interrupted_turns), write off
+    the rest so the client's spinner clears.
 
     The worker's try/except persists a terminal status on every clean
     exit (complete / error / cancelled), so the only way a message ends
@@ -676,13 +809,7 @@ async def _sweep_stale_streaming() -> None:
     Without this sweep the frontend's reconnect path sees status=
     'streaming' on page-load forever and the spinner never clears.
     """
-    try:
-        swept = await asyncio.to_thread(storage.sweep_stale_streaming_messages)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("stale-streaming sweep failed at boot: %r", exc)
-        return
-    if swept:
-        logger.info("stale-streaming sweep: flipped %d message(s) → error", swept)
+    await _recover_interrupted_turns()
 
 
 @app.on_event("startup")
@@ -3104,19 +3231,27 @@ async def _run_turn_worker(
                 })
     except asyncio.CancelledError:
         # Task-level cancellation (the cancel endpoint may resort to
-        # task.cancel() if aclose() is too slow). Treat as user cancel.
+        # task.cancel() if aclose() is too slow). Treat as user cancel —
+        # unless the PROCESS is shutting down: then leave the placeholder
+        # at 'streaming' so the next boot re-runs this turn.
         partial = "".join(full_text_parts)
-        try:
-            storage.update_assistant_message(
-                email, session_id, assistant_seq,
-                content=partial,
-                status=storage.ASSISTANT_STATUS_CANCELLED,
-            )
-        except Exception:
-            logger.exception(
-                "update_assistant_message(cancelled-via-task-cancel) failed for %s seq=%s",
+        if _shutting_down:
+            logger.warning(
+                "shutdown: leaving turn %s seq=%s for restart recovery",
                 session_id, assistant_seq,
             )
+        else:
+            try:
+                storage.update_assistant_message(
+                    email, session_id, assistant_seq,
+                    content=partial,
+                    status=storage.ASSISTANT_STATUS_CANCELLED,
+                )
+            except Exception:
+                logger.exception(
+                    "update_assistant_message(cancelled-via-task-cancel) failed for %s seq=%s",
+                    session_id, assistant_seq,
+                )
         # finalize() emits the terminal even though we were cancelled;
         # subscribers need it.
         try:
@@ -3171,12 +3306,15 @@ async def _run_turn_worker(
         # context on the next turn. Idempotent (no-op when there
         # are no attachments). Run AFTER gen.aclose() so we don't
         # race with the subprocess still reading the dir.
-        try:
-            attachments.delete_attachments_dir(session_id)
-        except Exception:  # pragma: no cover — best-effort
-            logger.exception(
-                "attachments cleanup failed for %s", session_id,
-            )
+        # Keep the uploads if we are dying with the process: the re-run
+        # after restart needs them.
+        if not _shutting_down:
+            try:
+                attachments.delete_attachments_dir(session_id)
+            except Exception:  # pragma: no cover — best-effort
+                logger.exception(
+                    "attachments cleanup failed for %s", session_id,
+                )
 
 
 # ===========================================================================
