@@ -374,8 +374,9 @@ AVAILABLE_MODELS: list[dict] = [
      "effort": ["low", "medium", "high", "max"]},
     {"label": "GLM-5.3",           "provider": "tokenhub",  "id": "glm-5.3",  "api_model": "glm-5.3",
      "effort": ["low", "high", "max"]},
-    {"label": "MiMo V2.6 Pro",     "provider": "mimo",      "id": "mimo-v2.6-pro", "api_model": "mimo-v2.6-pro",
-     "effort": None},
+    # MiMo V2.6 Pro (provider "mimo", id "mimo-v2.6-pro") parked 2026-09-28:
+    # the provider entry below stays wired, re-add the row once a key with
+    # MiMo scope exists.
     {"label": "Fable 5.1",         "provider": "anthropic", "id": "claude-fable-5-1",          "betas": None,
      "effort": ["low", "medium", "high", "xhigh", "max"]},
     {"label": "Opus 5.5",          "provider": "anthropic", "id": "claude-opus-5-5",           "betas": None,

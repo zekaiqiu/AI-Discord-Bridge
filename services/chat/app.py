@@ -172,8 +172,11 @@ class RenameSessionBody(BaseModel):
 # pytest suite runs there, hermetically.
 # ---------------------------------------------------------------------------
 CHAT_DEFAULT_MODEL = os.environ.get("CHAT_DEFAULT_MODEL", "").strip()
+# "mimo" (MiMo V2.6 Pro) is parked as of 2026-09-28: mimo_runner stays in
+# the tree but the alias is out of the lineup until a key with MiMo scope
+# exists, so a stored/POSTed "mimo" normalizes to the default model.
 NON_CLAUDE_MODELS = frozenset({
-    "glm", "kimi", "mimo", "qwen", "deepseek", "minimax", "gemma4-local",
+    "glm", "kimi", "qwen", "deepseek", "minimax", "gemma4-local",
 })
 
 

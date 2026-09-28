@@ -1,8 +1,8 @@
 """Bridge model table (!model) — lineup invariants.
 
-MiMo V2.6 Pro (Xiaomi) is the third option since 2026-09-28 and runs on its
-own OpenAI-compatible provider ("mimo"); without a key the host-tool loop
-returns a clear "not configured" line instead of erroring mid-turn.
+MiMo V2.6 Pro (Xiaomi) was added as the third option on 2026-09-28 and parked
+the same day (no key with MiMo scope). Its provider entry ("mimo") stays wired
+so the row can be re-added without code changes; the lineup must not list it.
 """
 from __future__ import annotations
 
@@ -12,14 +12,23 @@ import bot
 import bridge_account_router
 
 
-def test_mimo_is_third_option_and_registered():
+def test_mimo_is_parked_but_provider_stays_wired():
     ids = [m["id"] for m in bot.AVAILABLE_MODELS]
-    assert ids[:3] == ["kimi-k3", "glm-5.3", "mimo-v2.6-pro"]
-    m = bot._model_by_id("mimo-v2.6-pro")
-    assert m["provider"] == "mimo"
-    assert m["api_model"] == "mimo-v2.6-pro"
-    assert m["effort"] is None
+    assert ids[:2] == ["kimi-k3", "glm-5.3"]
+    assert "mimo-v2.6-pro" not in ids
+    assert bot._model_by_id("mimo-v2.6-pro") is None
     assert "mimo" in bot._OPENAI_PROVIDERS
+
+
+def test_persisted_mimo_choice_falls_back_to_default(monkeypatch, tmp_path):
+    f = tmp_path / "model"
+    f.write_text("mimo-v2.6-pro", encoding="utf-8")
+    monkeypatch.setattr(bot, "BRIDGE_MODEL_FILE", f)
+    assert bot.current_model()["id"] in ids_of(bot.AVAILABLE_MODELS)
+
+
+def ids_of(models):
+    return [m["id"] for m in models]
 
 
 def test_every_openai_model_has_a_provider_entry():

@@ -31,14 +31,16 @@ def _install_fake_mimo(monkeypatch: Any) -> dict[str, Any]:
     return captured
 
 
-def test_mimo_is_a_served_alias(monkeypatch):
+def test_mimo_is_parked_not_served(monkeypatch):
+    # Parked 2026-09-28: the runner module stays, the alias is out of the
+    # lineup, so a stale "mimo" from a saved thread/blob lands on the default.
     monkeypatch.setattr(app_module, "CHAT_DEFAULT_MODEL", "glm")
-    assert app_module._normalize_model("mimo") == "mimo"
-    assert app_module._is_api_model("mimo")
+    assert app_module._normalize_model("mimo") == "glm"
+    assert "mimo" not in app_module.NON_CLAUDE_MODELS
+    assert "mimo" not in storage._VALID_MODELS
     assert mimo_runner.is_mimo_model("mimo")
     assert not mimo_runner.is_mimo_model("glm")
     assert mimo_runner._MIMO_MODELS["mimo"] == "mimo-v2.6-pro"
-    assert "mimo" in storage._VALID_MODELS
     name, model_id, vendor = prompt_blocks.MODEL_IDENTITY["mimo"]
     assert model_id == "mimo-v2.6-pro" and vendor == "Xiaomi"
 
@@ -49,14 +51,14 @@ def test_mimo_has_no_effort_levels_until_probed():
     assert "mimo" not in app_module.EFFORT_LEVELS
 
 
-def test_settings_accept_mimo_default():
+def test_settings_migrate_mimo_default_to_glm():
     coerced = storage._coerce_settings({"default_model": "mimo"})
-    assert coerced["default_model"] == "mimo"
+    assert coerced["default_model"] == "glm"
     # unknown values still fall back to the default model
     assert storage._coerce_settings({"default_model": "nope"})["default_model"] == "glm"
 
 
-def test_dispatch_reaches_mimo_runner(
+def test_dispatch_never_reaches_mimo_runner_while_parked(
     client, auth_headers, fake_claude, monkeypatch, drain_background_tasks
 ):
     monkeypatch.setattr(app_module, "CHAT_DEFAULT_MODEL", "glm")
@@ -71,11 +73,7 @@ def test_dispatch_reaches_mimo_runner(
     assert resp.status_code == 200
     events = consume_sse(resp)
     assert [e.get("event") for e in events].count("done") == 1
-    assert len(captured["calls"]) == 1, "mimo_runner.run_turn was not called"
-    call = captured["calls"][0]
-    assert call["model"] == "mimo"
-    # unverified effort is dropped, never forwarded
-    assert call["effort"] is None
+    assert captured["calls"] == [], "parked model must not be dispatched"
 
 
 def test_runner_fails_closed_without_key(monkeypatch, tmp_path):
