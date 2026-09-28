@@ -43,7 +43,7 @@ def _collect(agen):
         async for ev in agen:
             out.append(ev)
         return out
-    return asyncio.get_event_loop().run_until_complete(_run())
+    return asyncio.run(_run())
 
 
 def _install_fake_spawn(monkeypatch_attr, behaviors):

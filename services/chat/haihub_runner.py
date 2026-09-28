@@ -61,6 +61,7 @@ _MAX_TOKENS = 8192
 # returns a tool-free answer. Each step is still bounded by _REQUEST_TIMEOUT
 # (model call) and _TOOL_TIMEOUT (run_bash), so a turn can't hang indefinitely.
 _TOOL_TIMEOUT = 90           # seconds per run_bash command (enforced in-container)
+_MAX_STEPS = 40              # tool round-trips per turn before we stop the loop
 _MAX_TOOL_OUTPUT = 16000     # chars of tool output fed back to the model
 
 # Generous read timeout: thinking models lag before first token.
@@ -465,6 +466,12 @@ async def run_turn(
         {"role": "user", "content": user_content},
     ]
 
+    # Visible text of every model step, in order. The reply the user keeps is
+    # ALL of it joined with blank lines — not just the last step's content —
+    # so narration streamed between tool calls survives into the persisted
+    # message, and a final step that only calls tools / says nothing does not
+    # wipe the reply ("No reply — this turn produced no text").
+    step_texts: list[str] = []
     final_text = ""
     turn_start = time.monotonic()
     # Accumulate usage across tool round-trips so the reported total covers
@@ -476,6 +483,16 @@ async def run_turn(
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
             for _step in itertools.count():
+                if _step >= _MAX_STEPS:
+                    cap_note = (
+                        f"[stopped after {_MAX_STEPS} tool steps without a "
+                        "final answer]"
+                    )
+                    if step_texts:
+                        yield {"type": "delta", "text": "\n\n"}
+                    yield {"type": "delta", "text": cap_note}
+                    step_texts.append(cap_note)
+                    break
                 payload: dict[str, Any] = {
                     "model": display,
                     "stream": True,
@@ -497,9 +514,17 @@ async def run_turn(
                     payload["reasoning_effort"] = effort
 
                 meta: dict[str, Any] | None = None
+                step_started = False
                 async for ev in _stream_step(client, payload, base_url=base, api_key=key):
                     t = ev["type"]
                     if t == "delta":
+                        if not step_started:
+                            step_started = True
+                            # Separate this step's text from the previous
+                            # step's in the live stream exactly as the
+                            # persisted join below does.
+                            if step_texts:
+                                yield {"type": "delta", "text": "\n\n"}
                         yield ev
                     elif t == "_error":
                         yield {"type": "error", "message": ev["message"]}
@@ -522,9 +547,10 @@ async def run_turn(
 
                 tool_calls = meta["tool_calls"]
                 step_content = meta["content"]
+                if step_content:
+                    step_texts.append(step_content)
 
                 if not tool_calls:
-                    final_text = step_content
                     break
 
                 # Record the assistant's tool-call message, then execute each.
@@ -576,6 +602,7 @@ async def run_turn(
         yield {"type": "error", "message": f"haihub run failed: {type(exc).__name__}"}
         return
 
+    final_text = "\n\n".join(step_texts)
     elapsed = max(time.monotonic() - turn_start, 0.0)
     if saw_usage:
         input_tok: int | None = acc_prompt

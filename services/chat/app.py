@@ -21,6 +21,7 @@ import asyncio
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import tarfile
@@ -1023,6 +1024,14 @@ _MEMORY_UPDATE_RE = re.compile(
     r"\n*<memory_update>\s*\n?(.*?)\n?\s*</memory(?:_update)?>\s*\Z",
     re.DOTALL,
 )
+# Same block, anywhere in the text. A tool-loop reply is the join of every
+# step's text, so a model that emitted the block in a middle step (before its
+# last tool call) leaves it mid-reply; it must still be applied and stripped
+# rather than shown raw to the user.
+_MEMORY_UPDATE_ANY_RE = re.compile(
+    r"[ \t]*\n*<memory_update>\s*\n?(.*?)\n?\s*</memory(?:_update)?>[ \t]*\n?",
+    re.DOTALL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1450,11 +1459,13 @@ def _extract_memory_update(text: str) -> tuple[str, str | None]:
     """
     if not text:
         return text, None
-    match = _MEMORY_UPDATE_RE.search(text)
-    if match is None:
+    matches = list(_MEMORY_UPDATE_ANY_RE.finditer(text))
+    if not matches:
         return text, None
-    new_memory = match.group(1).strip()
-    scrubbed = text[: match.start()].rstrip()
+    # Last block wins (the model's final view of memory); every block is
+    # stripped from what the user sees.
+    new_memory = matches[-1].group(1).strip()
+    scrubbed = _MEMORY_UPDATE_ANY_RE.sub("", text).rstrip()
     return scrubbed, new_memory
 
 
@@ -2019,6 +2030,35 @@ def _is_api_model(model: str | None) -> bool:
     )
 
 
+def _api_attachment_preamble(attachments_dir: Path, tool_path: str) -> str:
+    """Name the user's uploaded files (and where the run_bash tool can read
+    them) at the top of the prompt. The claude path does the same with a
+    Read-tool preamble; API models only have run_bash, so the wording
+    points at shell/python readers instead."""
+    try:
+        files = sorted(p for p in attachments_dir.iterdir() if p.is_file())
+    except OSError:
+        return ""
+    if not files:
+        return ""
+    lines = []
+    for p in files:
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        lines.append(f"  - {tool_path}/{p.name}  ({mime}, {size:,} bytes)")
+    return (
+        "[The user attached the following file(s). Read them with the "
+        "run_bash tool before answering (cat/head for text, python for "
+        "spreadsheets and data files, pdftotext or python for PDFs) — do not "
+        "answer without reading them.]\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
+
+
 def _api_model_turn_gen(
     *,
     model: str,
@@ -2031,6 +2071,7 @@ def _api_model_turn_gen(
     memory: str | None,
     output_language: str,
     effort: str | None,
+    attachments_dir: Path | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """One turn on a stateless API model, with the same tool/artifact
     dispatch for user turns AND scheduled wakes.
@@ -2055,6 +2096,22 @@ def _api_model_turn_gen(
         tool_workdir = "/home/felix"
         tool_home = "/home/felix"
         tool_artifacts = claude_runner.artifacts_path_for("host", session_id)
+    # Uploads: stage/translate the chat-side attachments dir to a path the
+    # tool container can open (per-user: docker put_archive into
+    # /workspace/.attachments/<sid>; admin host-shell: the bind-mounted host
+    # dir) and tell the model the files exist. Without this, uploads were
+    # silently invisible on the API-model path.
+    if attachments_dir is not None and tool_container:
+        dispatch = "user" if container else "host"
+        try:
+            tool_attach = claude_runner._claude_attachments_path(
+                attachments_dir, dispatch=dispatch, container_name=container,
+            )
+        except Exception:
+            logger.exception("attachment staging failed for %s", session_id)
+            tool_attach = None
+        if tool_attach:
+            user_text = _api_attachment_preamble(attachments_dir, tool_attach) + user_text
     return runner.run_turn(
         prompt=user_text,
         model=model,
@@ -2812,6 +2869,7 @@ async def _run_turn_worker(
                 memory=memory,
                 output_language=output_language,
                 effort=effort,
+                attachments_dir=attachments_dir,
             )
         elif _persistent_enabled():
             # A1: route the user turn through the session's long-lived
