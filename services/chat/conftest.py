@@ -11,6 +11,19 @@ These fixtures keep tests hermetic:
      pass overrides to drive the failure paths.
   * ``client`` — FastAPI TestClient with sessions dir + JWKS already wired.
   * ``auth_headers`` — short-hand to attach a default-valid token for an email.
+
+Hermetic guards (autouse, every test — see the block at the bottom):
+
+  * ``no_network`` — ``urllib.request.urlopen`` / ``httpx.get`` & co raise
+    AssertionError, so nothing can reach api.anthropic.com or Cloudflare.
+  * ``hermetic_accounts`` — ``account_router`` is re-pointed at a tmp
+    ``main`` home + a tmp wizerith pool (``account-1``, ``account-2``) with
+    fake credential files, and ``_fetch_usage`` returns a canned snapshot.
+  * ``fake_docker`` — ``docker.from_env()`` returns a MagicMock client whose
+    ``containers.get`` raises ``docker.errors.NotFound`` (opt in by
+    requesting the fixture and configuring the mock).
+  * ``hermetic_host_paths`` — ``/data/*`` and the host token-refresh script
+    are redirected under ``tmp_path``.
 """
 
 from __future__ import annotations
@@ -29,7 +42,9 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Callable
+from unittest.mock import MagicMock
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -463,3 +478,201 @@ async def drain_background_tasks() -> Any:
             return
 
     return _drain
+
+
+# ---------------------------------------------------------------------------
+# Hermetic guards (autouse for EVERY test).
+#
+# Before these existed the suite reached production from inside pytest:
+#   * ``account_router.pick()`` / ``is_usable()`` / ``snapshot_usage()`` hit
+#     the real https://api.anthropic.com/api/oauth/usage with real tokens read
+#     from /home/felix/.claude and /opt/wizerith/claude-accounts — which
+#     429-rate-limited the LIVE chat service's router as a side effect of
+#     running the tests.
+#   * ``docker.from_env()`` was called from app startup (``_heal_auth_proxies``
+#     — which then docker-exec'd into every live portfolio-user-* container),
+#     the ``post_message`` heal path, ``_collect_user_container_artifacts``,
+#     ``claude_runner._stage_attachments_into_user_container`` and
+#     ``user_container.ensure_*_container``.
+#   * ``user_container._host_credentials_path`` (via
+#     ``account_router.home_for_account``) streamed REAL credential bytes into
+#     the exec recorder, and the refresh path could shell out to
+#     ~/.local/bin/refresh-claude-tokens.
+#
+# Rule of thumb for new tests: never undo these; opt in to a richer fake by
+# requesting ``fake_docker`` / ``hermetic_accounts`` and configuring them.
+# ---------------------------------------------------------------------------
+
+FAKE_USAGE_SNAPSHOT: dict[str, Any] = {
+    "five_hour": {"utilization": 5.0, "resets_at": "2099-01-01T00:00:00Z"},
+    "seven_day": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"},
+}
+# Wizerith pool seeded under the tmp accounts root. ``main`` also exists but
+# is excluded from ``pick()`` by production's CHAT_ACCOUNT_EXCLUDE default.
+FAKE_POOL_ACCOUNTS: tuple[str, ...] = ("account-1", "account-2")
+
+
+def write_fake_credentials(home: Path, name: str) -> Path:
+    """Write a well-shaped, NON-secret ``.claude/.credentials.json`` under
+    ``home`` and return its path. Token ``tok-<name>``; expiry far enough out
+    that ``account_router.is_usable`` treats the account as alive."""
+    creds = home / ".claude" / ".credentials.json"
+    creds.parent.mkdir(parents=True, exist_ok=True)
+    creds.write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": f"tok-{name}",
+            "refreshToken": f"refresh-{name}",
+            "expiresAt": int((time.time() + 24 * 3600) * 1000),
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max",
+            "rateLimitTier": "default",
+        }
+    }), encoding="utf-8")
+    return creds
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
+    """Make every outbound HTTP call from the service modules fail loudly.
+
+    ``account_router._fetch_usage`` and ``auth._default_certs_fetcher`` use
+    ``urllib.request.urlopen``; ``auth._fetch_jwks_json`` uses ``httpx.get``.
+    The in-container auth-proxy health probe also calls ``urlopen`` but does
+    so INSIDE the per-user container via ``docker exec`` (i.e. through
+    ``subprocess.run``), so it is unaffected by this process-level guard.
+    """
+    import urllib.request
+
+    import httpx
+
+    def _blocked(*args: Any, **kwargs: Any) -> Any:
+        target = args[0] if args else kwargs.get("url")
+        target = getattr(target, "full_url", target)
+        raise AssertionError(
+            f"network access attempted from a test: {target!r} — tests must "
+            "stay hermetic (see conftest.py hermetic guards)"
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _blocked)
+    for name in ("get", "post", "put", "patch", "delete", "head", "request", "stream"):
+        monkeypatch.setattr(httpx, name, _blocked)
+    return _blocked
+
+
+@pytest.fixture(autouse=True)
+def hermetic_accounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_network: Any,
+) -> Any:
+    """Re-point ``account_router`` at a tmp account layout and can its usage
+    fetch, so routing never reads real credentials or calls the usage API.
+
+    Returns a namespace: ``main_home``, ``accounts_root``, ``accounts``,
+    ``usage`` (the canned snapshot) and ``real_fetch_usage`` (the un-patched
+    function, so a test can prove the network guard trips it).
+    """
+    import account_router
+    import user_container
+
+    root = tmp_path / "hermetic-accounts"
+    main_home = root / "main_home"
+    write_fake_credentials(main_home, "main")
+    accounts_root = root / "claude-accounts"
+    for name in FAKE_POOL_ACCOUNTS:
+        write_fake_credentials(accounts_root / name, name)
+
+    # The module constants are computed at import time from these env vars;
+    # set both so a re-import in a test sees the same layout.
+    monkeypatch.setenv("CHAT_MAIN_HOME", str(main_home))
+    monkeypatch.setenv("WIZERITH_ACCOUNTS_ROOT", str(accounts_root))
+    monkeypatch.setattr(account_router, "MAIN_HOME", main_home)
+    monkeypatch.setattr(
+        account_router, "MAIN_CREDENTIALS", main_home / ".claude" / ".credentials.json",
+    )
+    monkeypatch.setattr(account_router, "WIZERITH_ACCOUNTS_ROOT", accounts_root)
+
+    real_fetch_usage = account_router._fetch_usage
+
+    def _canned_usage(access_token: str) -> dict[str, Any] | None:
+        if not access_token:
+            return None
+        return json.loads(json.dumps(FAKE_USAGE_SNAPSHOT))  # fresh copy per call
+
+    monkeypatch.setattr(account_router, "_fetch_usage", _canned_usage)
+
+    # Module-level caches: never let one test's routing state leak into the
+    # next (the usage cache is keyed by account NAME, which tests reuse).
+    account_router._reset_for_tests()
+    user_container._REFRESH_CACHE.clear()
+    user_container._STREAMED_ACCOUNT.clear()
+    yield SimpleNamespace(
+        main_home=main_home,
+        accounts_root=accounts_root,
+        accounts=FAKE_POOL_ACCOUNTS,
+        usage=FAKE_USAGE_SNAPSHOT,
+        real_fetch_usage=real_fetch_usage,
+    )
+    account_router._reset_for_tests()
+    user_container._REFRESH_CACHE.clear()
+    user_container._STREAMED_ACCOUNT.clear()
+
+
+@pytest.fixture(autouse=True)
+def fake_docker(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Replace ``docker.from_env`` with a MagicMock client for every test.
+
+    Default posture is "empty daemon": ``containers.get`` / ``networks.get``
+    / ``volumes.get`` raise ``docker.errors.NotFound`` and
+    ``containers.list`` returns ``[]``. A test that needs a container to
+    exist requests this fixture and sets e.g.
+    ``fake_docker.containers.get.side_effect = None;
+    fake_docker.containers.get.return_value = MagicMock()``.
+
+    All production call sites use ``docker.from_env()`` on the module object
+    (``app``, ``claude_runner``, ``user_container``, ``haihub_runner``,
+    ``user_container_eviction``), so patching the one attribute covers them.
+    """
+    import docker
+    import docker.errors
+
+    client = MagicMock(name="hermetic_docker_client")
+    client.containers.get.side_effect = docker.errors.NotFound(
+        "hermetic test double: no such container",
+    )
+    client.containers.list.return_value = []
+    client.networks.get.side_effect = docker.errors.NotFound(
+        "hermetic test double: no such network",
+    )
+    client.volumes.get.side_effect = docker.errors.NotFound(
+        "hermetic test double: no such volume",
+    )
+    monkeypatch.setattr(docker, "from_env", lambda *a, **kw: client)
+    return client
+
+
+@pytest.fixture(autouse=True)
+def hermetic_host_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect every host/``/data`` path the service reads or writes.
+
+    ``tmp_sessions_dir`` / ``tmp_attachments_dir`` set the same two values
+    (same ``tmp_path`` sub-dirs), so tests that request them explicitly see
+    no difference; this just makes the redirect unconditional.
+    """
+    import user_container
+
+    monkeypatch.setenv("CHAT_SESSIONS_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setenv("CHAT_ATTACHMENTS_DIR", str(tmp_path / "attachments"))
+    monkeypatch.setenv(
+        "CHAT_ATTACHMENT_PREVIEWS_DIR", str(tmp_path / "attachment_previews"),
+    )
+    monkeypatch.setenv("CHAT_GENERATED_DIR", str(tmp_path / "generated"))
+    monkeypatch.setenv(
+        user_container.USER_NETWORK_ALLOCATIONS_ENV,
+        str(tmp_path / "user-network-allocations.json"),
+    )
+    # The host token-refresh script is resolved into a module constant at
+    # import time; point both the env and the constant at a path that does
+    # not exist so ``_host_refresh_tokens_if_needed`` can only ever no-op.
+    refresh_script = str(tmp_path / "no-such-refresh-claude-tokens")
+    monkeypatch.setenv("ANTHROPIC_HOST_REFRESH_SCRIPT", refresh_script)
+    monkeypatch.setattr(user_container, "HOST_TOKEN_REFRESH_SCRIPT", refresh_script)
+    return tmp_path

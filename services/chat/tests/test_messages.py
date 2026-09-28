@@ -149,6 +149,14 @@ def test_malformed_json_emits_one_error_no_done(client, auth_headers, fake_claud
 # ---------------------------------------------------------------------------
 
 def test_email_not_leaked_to_claude_seam(client, auth_headers, fake_claude):
+    """The signed-in email reaches claude in exactly ONE place: the
+    ``--append-system-prompt`` identity directive (commit 673b949,
+    ``claude_runner.build_identity_system_prompt``) — that is what stops the
+    pooled billing account's profile name from being surfaced as the user.
+    Anywhere else (any other argv element, the prompt text, stdin) is a leak.
+    """
+    import claude_runner
+
     fake_claude.set_scenario("happy")
     leaked_email = "verysecret-leak@example.org"
     headers = auth_headers(leaked_email)
@@ -162,12 +170,34 @@ def test_email_not_leaked_to_claude_seam(client, auth_headers, fake_claude):
     assert resp.status_code == 200
     _consume_sse(resp)
 
-    # Recorder captures EVERY spawn_claude(args, stdin) call. Concatenate and
-    # search for the email anywhere — argv, stdin, anywhere.
-    blob = fake_claude.all_text
-    assert leaked_email not in blob, (
-        f"email leaked into claude args/stdin:\n{blob}"
-    )
+    identity = claude_runner.build_identity_system_prompt(leaked_email)
+    assert identity and leaked_email in identity  # the seam itself names the user
+
+    # Recorder captures EVERY spawn_claude(args, stdin) call (main turn +
+    # title task). Split each argv into the --append-system-prompt value(s)
+    # and everything else; the email may appear only in the former.
+    assert fake_claude.calls, "spawn_claude was never called"
+    directives: list[str] = []
+    for call in fake_claude.calls:
+        args = [str(a) for a in call["args"]]
+        rest: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--append-system-prompt" and i + 1 < len(args):
+                directives.append(args[i + 1])
+                i += 2
+                continue
+            rest.append(args[i])
+            i += 1
+        if call["stdin"]:
+            rest.append(str(call["stdin"]))
+        blob = "\n".join(rest)
+        assert leaked_email not in blob, (
+            f"email leaked outside --append-system-prompt:\n{blob}"
+        )
+
+    # ...and it DOES appear there, via the identity seam, for the main turn.
+    assert any(identity in d for d in directives), directives
 
 
 # ---------------------------------------------------------------------------

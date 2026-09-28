@@ -60,9 +60,12 @@ def test_api_routes_unaffected_by_spa_fallback(client, auth_headers):
     # And with auth, /api/me works as before.
     resp = client.get("/api/me", headers=auth_headers("alice@example.com"))
     assert resp.status_code == 200
-    # Phase 1 (role): response is now ``{email, role}``; alice is not felix
-    # and there is no sandbox_users.json on disk, so role is "user".
-    assert resp.json() == {"email": "alice@example.com", "role": "user"}
+    # Phase 1 (role): response carries ``email`` + ``role`` (plus SPA
+    # bootstrap extras — assert the identity subset only); alice is not
+    # felix and there is no sandbox_users.json on disk, so role is "user".
+    body = resp.json()
+    assert body["email"] == "alice@example.com"
+    assert body["role"] == "user"
 
 
 def test_unknown_api_path_404s_does_not_fall_through(client, auth_headers):

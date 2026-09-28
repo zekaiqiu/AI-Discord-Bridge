@@ -21,6 +21,13 @@ def fake_layout(tmp_path, monkeypatch):
     wiz_root = tmp_path / "wiz" / "claude-accounts"
     wiz_root.mkdir(parents=True)
 
+    # Production excludes ``main`` from the pick pool (CHAT_ACCOUNT_EXCLUDE
+    # defaults to "main" — the bridge user's primary plan must not be billed
+    # by web-chat sessions). The pool tests below were written with main in
+    # the pool, so re-allow it here; the exclude contract has its own tests
+    # in the "CHAT_ACCOUNT_EXCLUDE" section.
+    monkeypatch.setenv("CHAT_ACCOUNT_EXCLUDE", "")
+
     monkeypatch.setattr(account_router, "MAIN_HOME", main_home)
     monkeypatch.setattr(
         account_router, "MAIN_CREDENTIALS",
@@ -133,6 +140,8 @@ def test_pick_raises_no_accounts_when_disk_empty(tmp_path, monkeypatch):
 
 
 def test_pick_skips_accounts_with_unfetchable_usage(fake_layout, monkeypatch):
+    """While at least one account HAS a usage snapshot, an account whose
+    usage can't be fetched is skipped rather than guessed at."""
     fake_layout("main", util_5h=10)
     fake_layout("account-2")
     real = account_router._fetch_usage
@@ -144,6 +153,112 @@ def test_pick_skips_accounts_with_unfetchable_usage(fake_layout, monkeypatch):
     monkeypatch.setattr(account_router, "_fetch_usage", selective)
 
     assert account_router.pick().name == "main"
+
+
+# ---------------------------------------------------------------------------
+# Fail-open: no usage data for ANY candidate (quota API 429 / outage).
+# ---------------------------------------------------------------------------
+
+def test_pick_fails_open_to_first_readable_token_when_no_usage_anywhere(
+    fake_layout, monkeypatch,
+):
+    """If the usage API is unreachable for EVERY candidate, pick() must not
+    raise — that would drop all new-user provisioning whenever Anthropic's
+    quota API rate-limits us. It routes to the first (sorted) candidate with
+    a readable credentials file instead."""
+    fake_layout("account-3")
+    fake_layout("account-2")
+    monkeypatch.setattr(account_router, "_fetch_usage", lambda tok: None)
+    assert account_router.pick().name == "account-2"
+
+
+def test_pick_fail_open_never_returns_an_account_in_live_429_cooldown(
+    fake_layout, monkeypatch,
+):
+    """An observed 429 (mark_hot) is stronger than "usage unavailable": a
+    hot account is never a fail-open candidate. Because the hot account still
+    counts as a discovered candidate, fail-open (which requires usage to be
+    missing for EVERY candidate) does not trigger at all — pick() raises
+    rather than routing anywhere."""
+    fake_layout("account-2")
+    fake_layout("account-3")
+    monkeypatch.setattr(account_router, "_fetch_usage", lambda tok: None)
+    account_router.mark_hot("account-2", until_ts=time.time() + 300)
+    with pytest.raises(account_router.NoAccountsAvailable):
+        account_router.pick()
+    # Once the cooldown clears, fail-open resumes and skips nothing.
+    account_router.note_success("account-2")
+    assert account_router.pick().name == "account-2"
+
+
+def test_pick_does_not_fail_open_when_some_usage_is_known(fake_layout, monkeypatch):
+    """Fail-open is only for "no data at all". If one account reported
+    usage and is saturated while the other is unfetchable, that is a
+    genuine no-usable-account situation."""
+    fake_layout("account-2", util_5h=95)
+    fake_layout("account-3")
+    real = account_router._fetch_usage
+
+    def selective(token):
+        return None if token == "tok-account-3" else real(token)
+    monkeypatch.setattr(account_router, "_fetch_usage", selective)
+    with pytest.raises(account_router.NoAccountsAvailable):
+        account_router.pick()
+
+
+# ---------------------------------------------------------------------------
+# CHAT_ACCOUNT_EXCLUDE: ``main`` is out of the pick pool by default.
+# ---------------------------------------------------------------------------
+
+def test_list_accounts_excludes_main_by_default(fake_layout, monkeypatch):
+    monkeypatch.delenv("CHAT_ACCOUNT_EXCLUDE", raising=False)
+    fake_layout("main")
+    fake_layout("account-2")
+    assert [n for n, _ in account_router.list_accounts()] == ["account-2"]
+
+
+def test_pick_never_returns_main_by_default(fake_layout, monkeypatch):
+    """Even when main has the most headroom it is not billable by chat."""
+    monkeypatch.delenv("CHAT_ACCOUNT_EXCLUDE", raising=False)
+    fake_layout("main", util_5h=0)
+    fake_layout("account-2", util_5h=60)
+    assert account_router.pick().name == "account-2"
+
+
+def test_pick_raises_when_only_main_exists_by_default(fake_layout, monkeypatch):
+    monkeypatch.delenv("CHAT_ACCOUNT_EXCLUDE", raising=False)
+    fake_layout("main")
+    with pytest.raises(account_router.NoAccountsAvailable):
+        account_router.pick()
+
+
+def test_exclude_env_is_a_comma_list_of_names(fake_layout, monkeypatch):
+    monkeypatch.setenv("CHAT_ACCOUNT_EXCLUDE", "main, account-2")
+    fake_layout("main")
+    fake_layout("account-2")
+    fake_layout("account-3")
+    assert [n for n, _ in account_router.list_accounts()] == ["account-3"]
+
+
+def test_home_for_account_ignores_exclude_filter(fake_layout, monkeypatch):
+    """The exclude list gates NEW picks only. Sessions already locked to
+    ``main`` must keep resolving to its HOME (otherwise their credential
+    refresh would break mid-conversation)."""
+    monkeypatch.delenv("CHAT_ACCOUNT_EXCLUDE", raising=False)
+    fake_layout("main")
+    assert account_router.home_for_account("main") == account_router.MAIN_HOME
+    assert account_router.is_usable("main") is True
+
+
+# ---------------------------------------------------------------------------
+# Hermeticity: the only network seam is ``_fetch_usage`` and the suite-wide
+# guard trips it. Every routing test in this file therefore ran on the
+# canned/faked snapshot, never the live usage API.
+# ---------------------------------------------------------------------------
+
+def test_real_fetch_usage_is_blocked_by_the_no_network_guard(hermetic_accounts):
+    with pytest.raises(AssertionError, match="network access attempted"):
+        hermetic_accounts.real_fetch_usage("tok-anything")
 
 
 # ---------------------------------------------------------------------------

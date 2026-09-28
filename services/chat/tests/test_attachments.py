@@ -1,4 +1,4 @@
-"""Attachment uploads: MIME whitelist, size cap, count cap, collision, purge-on-delete."""
+"""Attachment uploads: no MIME allow-list, size cap, count cap, collision, purge-on-delete."""
 
 from __future__ import annotations
 
@@ -79,14 +79,22 @@ def test_attachment_files_have_mode_0640(client, auth_headers, tmp_attachments_d
 # Rejection paths.
 # ---------------------------------------------------------------------------
 
-def test_non_whitelisted_mime_rejected_415(client, auth_headers):
+def test_unlisted_mime_type_accepted(client, auth_headers, tmp_attachments_dir: Path):
+    """There is deliberately NO file-type allow-list (attachments.py): every
+    format is accepted, including unknown/executable ones. Safety comes from
+    the filename guard, the per-file size cap and per-user sandbox isolation
+    — not from MIME gating. (Was: 415 for non-whitelisted types.)"""
     headers = auth_headers(USER_A)
     sid = _create_session(client, headers)
     resp = _upload(
         client, sid, headers,
         [("files", ("evil.exe", b"MZ\x90\x00", "application/x-msdownload"))],
     )
-    assert resp.status_code == 415, resp.text
+    assert resp.status_code == 200, resp.text
+    saved = resp.json()
+    assert [s["filename"] for s in saved] == ["evil.exe"]
+    assert saved[0]["mime"] == "application/x-msdownload"
+    assert (tmp_attachments_dir / sid / "evil.exe").read_bytes() == b"MZ\x90\x00"
 
 
 def test_oversized_file_rejected_413(client, auth_headers):
@@ -191,8 +199,28 @@ def test_cross_email_upload_404_no_dir_created(
 # ---------------------------------------------------------------------------
 
 def test_run_turn_passes_add_dir_when_attachments_present(
-    client, auth_headers, fake_claude, tmp_attachments_dir: Path,
+    client, auth_headers, fake_claude, tmp_attachments_dir: Path, monkeypatch,
 ):
+    """A non-admin session dispatches into the per-user container, which
+    cannot see the chat-side attachments dir. The runner therefore STAGES the
+    files into the container (``claude_runner._stage_attachments_into_user_
+    container`` — a docker put_archive) and passes the container-side path to
+    ``--add-dir``. Staging is faked here (no docker daemon); we assert it was
+    asked to stage THIS session's dir into THIS user's container and that its
+    return value is what claude receives."""
+    import claude_runner
+    from user_container import container_name_for
+
+    staged: list[tuple[str, str, Path]] = []
+
+    def fake_stage(container_name, session_id, attachments_dir, *, docker_client=None):
+        staged.append((container_name, session_id, Path(attachments_dir)))
+        return f"/workspace/.attachments/{session_id}"
+
+    monkeypatch.setattr(
+        claude_runner, "_stage_attachments_into_user_container", fake_stage,
+    )
+
     headers = auth_headers(USER_A)
     sid = _create_session(client, headers)
     _upload(client, sid, headers, [("files", ("a.txt", b"x", "text/plain"))])
@@ -206,17 +234,18 @@ def test_run_turn_passes_add_dir_when_attachments_present(
     # Drain so the call is fully recorded.
     resp.text  # noqa: B018
 
-    # The first call (the turn) should carry an --add-dir for the
-    # session's attachments dir. Prod also unconditionally `--add-dir`s
-    # /home/felix to give the agent host-tree reach, so we look for the
-    # session-attachments dir specifically rather than the FIRST
-    # --add-dir occurrence.
-    turn_call = fake_claude.calls[0]
-    args = turn_call["args"]
-    expected = str(tmp_attachments_dir / sid)
-    assert any(a == expected for a in args), (
-        f"session attachments dir {expected!r} not in args: {args}"
+    assert staged == [(container_name_for(USER_A), sid, tmp_attachments_dir / sid)]
+
+    # The main turn (not the parallel title call) carries --add-dir with the
+    # container-side path; the chat-side tmp dir must NOT leak into argv.
+    turn_call = next(
+        c for c in fake_claude.calls
+        if not any(isinstance(a, str) and "Summarize" in a for a in c["args"])
     )
+    args = turn_call["args"]
+    add_dirs = [args[i + 1] for i, a in enumerate(args[:-1]) if a == "--add-dir"]
+    assert f"/workspace/.attachments/{sid}" in add_dirs, args
+    assert str(tmp_attachments_dir / sid) not in args
 
 
 def test_run_turn_omits_add_dir_when_no_attachments(

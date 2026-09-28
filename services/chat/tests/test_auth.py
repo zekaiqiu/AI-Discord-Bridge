@@ -60,8 +60,16 @@ def test_me_accepts_valid_token(client, auth_headers):
     resp = client.get("/api/me", headers=auth_headers("alice@example.com"))
     assert resp.status_code == 200
     # Phase 1 (role) added a ``role`` field; alice is not felix and there
-    # is no sandbox_users.json on disk, so role resolves to "user".
-    assert resp.json() == {"email": "alice@example.com", "role": "user"}
+    # is no sandbox_users.json on disk, so role resolves to "user". The
+    # response is additive: it also bundles the SPA bootstrap fields, so
+    # assert the identity subset + the shape of the extras, not whole-dict
+    # equality.
+    body = resp.json()
+    assert body["email"] == "alice@example.com"
+    assert body["role"] == "user"
+    assert isinstance(body["settings"], dict)
+    assert isinstance(body["shared_workspace_enabled"], bool)
+    assert isinstance(body["max_message_bytes"], int)
 
 
 def test_me_rejects_token_missing_email_claim(client, mint_jwt):

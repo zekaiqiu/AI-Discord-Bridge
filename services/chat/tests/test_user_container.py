@@ -26,6 +26,11 @@ from user_container import (
     refresh_credentials_if_stale,
 )
 
+# The un-patched resolver, captured at import so the resolve_usable_account
+# tests can restore it (the module-wide ``exec_recorder`` fixture pins the
+# function to identity for everything else).
+_REAL_RESOLVE_USABLE_ACCOUNT = user_container.resolve_usable_account
+
 # computed once; reused by all tests in this module
 EMAIL = "test@example.com"
 EXPECTED_NAME = container_name_for(EMAIL)
@@ -94,13 +99,23 @@ def exec_recorder(monkeypatch, tmp_path):
     # Patch user_container.subprocess.run — the module-local seam.
     monkeypatch.setattr(user_container.subprocess, "run", rec.fake_run)
     # Stage a fake host credentials file. populate_credentials calls
-    # _host_credentials_path(account) which joins
-    # CLAUDE_ACCOUNTS_HOST_PATH/<account>/.claude/.credentials.json.
-    # Redirect that constant at a tmp dir we control.
+    # _host_credentials_path(account), which resolves the account's HOME via
+    # ``account_router.home_for_account`` (the old CLAUDE_ACCOUNTS_HOST_PATH
+    # constant is dead). Point that seam at a tmp layout we control, and pin
+    # ``resolve_usable_account`` to identity so refresh_credentials_if_stale
+    # never consults the router's usage probe for the requested account.
+    import account_router
+
     fake_root = tmp_path / "claude-accounts"
     (fake_root / "account-1" / ".claude").mkdir(parents=True)
-    (fake_root / "account-1" / ".claude" / ".credentials.json").write_bytes(CRED_BYTES)
-    monkeypatch.setattr(user_container, "CLAUDE_ACCOUNTS_HOST_PATH", str(fake_root))
+    host_creds = fake_root / "account-1" / ".claude" / ".credentials.json"
+    host_creds.write_bytes(CRED_BYTES)
+    monkeypatch.setattr(
+        account_router, "home_for_account", lambda name: fake_root / (name or "main"),
+    )
+    monkeypatch.setattr(user_container, "resolve_usable_account", lambda requested: requested)
+    rec.accounts_root = fake_root
+    rec.host_creds_path = str(host_creds)
     # Item 3: redirect the per-user network allocations file at a tmp
     # path so the test suite never reads/writes /data/... on the host.
     alloc_path = tmp_path / "user-network-allocations.json"
@@ -235,7 +250,10 @@ def test_run_kwargs_environment():
     kw = _run_kwargs(client)
     env = kw["environment"]
     assert env["HOME"] == "/workspace"
-    assert env["PATH"].startswith("/home/linuxbrew/.linuxbrew/bin")
+    # nix profiles (per-user /workspace, then the image's /app) come first so
+    # nix-installed tools win; linuxbrew is still on the PATH after them.
+    assert env["PATH"].startswith("/workspace/.nix-profile/bin:/app/.nix-profile/bin:")
+    assert "/home/linuxbrew/.linuxbrew/bin" in env["PATH"].split(":")
 
 
 def test_run_kwargs_mounts():
@@ -513,10 +531,7 @@ def test_refresh_triggers_when_host_source_newer(exec_recorder, tmp_path, monkey
     fresh = _time.time() - 300
     exec_recorder.set_stat_reply(mtime=fresh)
     # But the host source mtime is newer than the in-container mtime.
-    src_path = _os.path.join(
-        user_container.CLAUDE_ACCOUNTS_HOST_PATH,
-        "account-1", ".claude", ".credentials.json",
-    )
+    src_path = exec_recorder.host_creds_path
     newer = _time.time()  # right now > fresh (5 min ago)
     _os.utime(src_path, (newer, newer))
     refresh_credentials_if_stale("portfolio-user-newhost", "account-1")
@@ -530,10 +545,7 @@ def test_refresh_no_op_when_in_container_fresh_and_host_older(exec_recorder):
     in_container = _time.time() - 300
     exec_recorder.set_stat_reply(mtime=in_container)
     # Host source is OLDER than in-container (10 min old).
-    src_path = _os.path.join(
-        user_container.CLAUDE_ACCOUNTS_HOST_PATH,
-        "account-1", ".claude", ".credentials.json",
-    )
+    src_path = exec_recorder.host_creds_path
     host_older = _time.time() - 600
     _os.utime(src_path, (host_older, host_older))
     refresh_credentials_if_stale("portfolio-user-fresh", "account-1")
@@ -862,8 +874,14 @@ class _FakeRouter:
 
 
 def _patch_router(monkeypatch, router):
+    """Swap in a fake ``account_router`` AND restore the real
+    ``resolve_usable_account`` (the autouse ``exec_recorder`` pins it to
+    identity), so these tests exercise the real resolver against the fake."""
     import sys
     monkeypatch.setitem(sys.modules, "account_router", router)
+    monkeypatch.setattr(
+        user_container, "resolve_usable_account", _REAL_RESOLVE_USABLE_ACCOUNT,
+    )
 
 
 def test_resolve_keeps_usable_requested(monkeypatch):
