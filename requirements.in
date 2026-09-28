@@ -1,0 +1,13 @@
+# Direct dependencies for claude-bridge. Regenerate requirements.txt with pip-tools:
+#   pip-compile --generate-hashes=false --output-file=requirements.txt requirements.in
+discord.py
+fastapi
+pydantic
+uvicorn
+PyJWT
+httpx
+python-dotenv
+croniter
+pypdf
+pytest
+pytest-asyncio

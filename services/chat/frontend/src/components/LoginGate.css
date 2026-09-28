@@ -1,0 +1,202 @@
+.login-gate-shell {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: #0a0a0c;
+  color: #f4f4f5;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  z-index: 9999;
+  overflow: hidden;
+}
+
+/* Aurora gradients to match the landing. */
+.login-gate-shell::before,
+.login-gate-shell::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.32;
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+.login-gate-shell::before {
+  width: 600px; height: 600px;
+  top: -150px; left: -100px;
+  background: radial-gradient(circle, #7c3aed 0%, transparent 65%);
+}
+.login-gate-shell::after {
+  width: 500px; height: 500px;
+  bottom: -150px; right: -100px;
+  background: radial-gradient(circle, #2563eb 0%, transparent 65%);
+  opacity: 0.22;
+}
+
+.login-gate-card { position: relative; z-index: 1; }
+
+.login-gate-card {
+  width: min(420px, calc(100vw - 32px));
+  background: #1e1e1e;
+  border: 1px solid #2a2a2a;
+  border-radius: 16px;
+  padding: 32px 28px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+}
+
+/* Wizerith brand uses the company logo image instead of the gradient
+ * text title. Sized to roughly the same visual height as the heading
+ * it replaces so other card metrics don't shift. */
+.login-gate-logo {
+  display: block;
+  margin: 0 auto 18px;
+  height: 56px;
+  width: auto;
+  max-width: 80%;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.login-gate-title {
+  margin: 0 0 24px;
+  font-family: 'Instrument Serif', Georgia, serif;
+  font-style: italic;
+  font-size: 32px;
+  font-weight: 400;
+  text-align: center;
+  letter-spacing: -0.01em;
+  background: linear-gradient(180deg, #ffffff 0%, #a1a1aa 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.login-gate-tabs {
+  display: flex;
+  gap: 4px;
+  background: #161616;
+  border-radius: 8px;
+  padding: 4px;
+  margin-bottom: 20px;
+}
+
+.login-gate-tabs button {
+  flex: 1;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  color: #a1a1aa;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.login-gate-tabs button:hover {
+  color: #f4f4f5;
+}
+
+.login-gate-tabs button.active {
+  background: #2a2a2a;
+  color: #f4f4f5;
+}
+
+.login-gate-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.login-gate-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #a1a1aa;
+  letter-spacing: 0.2px;
+}
+
+.login-gate-form input {
+  background: #161616;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 14px;
+  color: #f4f4f5;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.login-gate-form input:focus {
+  border-color: #3f3f46;
+}
+
+.login-gate-card .primary,
+.login-gate-form .primary {
+  margin-top: 6px;
+  padding: 11px 16px;
+  background: #f4f4f5;
+  color: #0f0f0f;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.login-gate-form .primary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.login-gate-form .primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.login-gate-form .link {
+  align-self: flex-start;
+  margin-top: -4px;
+  background: transparent;
+  border: none;
+  color: #a1a1aa;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.login-gate-form .link:hover {
+  color: #f4f4f5;
+}
+
+.login-gate-error {
+  margin: 0;
+  padding: 8px 12px;
+  background: rgba(220, 38, 38, 0.12);
+  border: 1px solid rgba(220, 38, 38, 0.3);
+  border-radius: 8px;
+  color: #fca5a5;
+  font-size: 13px;
+}
+
+.login-gate-info {
+  margin: 0;
+  padding: 8px 12px;
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+  border-radius: 8px;
+  color: #86efac;
+  font-size: 13px;
+}
+
+.login-gate-footnote {
+  margin: 20px 0 0;
+  font-size: 11px;
+  color: #71717a;
+  text-align: center;
+  line-height: 1.5;
+}

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>codebase · ald3.com</title>
+<link rel="stylesheet" href="/static/style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.1/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.1/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<header>
+  <h1>codebase</h1>
+  <nav>
+    <a href="https://cost.ald3.com/" target="_blank">cost</a>
+    <a href="https://cost.ald3.com/agents" target="_blank">agents</a>
+    <a href="/" class="cur">map</a>
+  </nav>
+  <span class="who">{{ user_email }}</span>
+</header>
+
+<div id="hud">
+  <div class="hud-row">
+    <span id="status" class="muted">loading…</span>
+    <button id="refresh" type="button">refresh</button>
+  </div>
+  <div class="hud-row">
+    <label class="ck"><input type="checkbox" id="toggle-rotate" checked> auto-rotate</label>
+    <label class="ck"><input type="checkbox" id="toggle-labels" checked> repo labels</label>
+  </div>
+  <div class="legend">
+    <div class="leg-row"><span class="leg-grad"></span><span class="leg-cap">recent → old</span></div>
+    <div class="leg-row leg-tot" id="totals"></div>
+  </div>
+</div>
+
+<div id="panel" class="hidden">
+  <div class="panel-head">
+    <span id="panel-path"></span>
+    <button id="panel-close" type="button">×</button>
+  </div>
+  <table class="panel-meta">
+    <tbody>
+      <tr><td>repo</td><td id="panel-repo"></td></tr>
+      <tr><td>loc</td><td id="panel-loc"></td></tr>
+      <tr><td>size</td><td id="panel-size"></td></tr>
+      <tr><td>modified</td><td id="panel-mtime"></td></tr>
+      <tr><td>extension</td><td id="panel-ext"></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<canvas id="scene"></canvas>
+
+<script type="module" src="/static/codebase.js"></script>
+</body>
+</html>

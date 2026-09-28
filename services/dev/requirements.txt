@@ -1,0 +1,23 @@
+# dev-wizerith backend. Mirrors term-router's set — the chat package we
+# bind-mount expects both python-jose (legacy verify_jwt path) AND PyJWT
+# (the new verify_cf_access_jwt path) to be importable at module load.
+fastapi>=0.110,<1.0
+# Multipart parser for UploadFile in /api/files/upload. FastAPI imports
+# it lazily; missing-at-import isn't a crash, but uploads would 500.
+python-multipart>=0.0.9,<1.0
+uvicorn[standard]>=0.27,<1.0
+PyJWT[crypto]>=2.8,<3.0
+# bcrypt + email-validator: pulled in only because dev-ald3 (AUTH_MODE=local)
+# imports services.chat.local_auth. Harmless on dev-wizerith — local_auth
+# is not imported there because chat_local_auth stays None.
+bcrypt>=4.0,<5.0
+email-validator>=2.0,<3.0
+# Pulled in transitively because services/chat/auth.py imports both at
+# top level — even though we only call the PyJWT path.
+httpx>=0.27,<1.0
+python-jose[cryptography]>=3.3,<4.0
+# services/chat/user_container.py uses the docker SDK.
+docker>=7.0.0,<8.0.0
+# pydantic ships with FastAPI but pin it so the dev-wizerith image's
+# behaviour doesn't drift on a fastapi minor bump.
+pydantic>=2.0,<3.0

@@ -1,0 +1,9 @@
+[Unit]
+Description=Post a progress line about actively-working chat sessions
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/Multi-Agent-Framework/claude-bridge/ops/session_progress.py
+StandardOutput=journal
+StandardError=journal

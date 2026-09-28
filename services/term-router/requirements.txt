@@ -1,0 +1,18 @@
+# Phase 4: term-router service deps. Additive only — preserve any future entries.
+fastapi>=0.110,<1.0
+# Multipart parser for /api/files/upload — FastAPI's UploadFile needs it
+# at request time. Imported lazily, so missing-at-import isn't an error,
+# but a real upload would 500 without it.
+python-multipart>=0.0.9,<1.0
+uvicorn[standard]>=0.27,<1.0
+websockets>=12.0,<14.0
+docker>=7.0.0,<8.0.0
+PyJWT[crypto]>=2.8,<3.0
+# Pulled in transitively because we bind-mount services/chat and import auth.py
+# (top-level `import httpx` for the legacy verify_jwt path; python-jose for the
+# legacy JWT verifier). Term-router itself only uses verify_cf_access_jwt
+# (PyJWT) but the module loads everything at import time.
+httpx>=0.27,<1.0
+python-jose[cryptography]>=3.3,<4.0
+# Imports services.chat.auth and services.chat.user_container — these live in
+# the bind-mounted chat package; no separate install needed.

@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch chat sessions whose scheduled-wake chain must not die silently
+After=docker.service
+
+[Service]
+Type=oneshot
+# Runs on the HOST, not inside the chat container, on purpose: an observer
+# that shares a failure domain with the thing it observes is not an observer.
+# If the chat container wedges or is recreated, this still fires.
+ExecStart=/usr/bin/python3 %h/Multi-Agent-Framework/claude-bridge/ops/wake_watchdog.py
+StandardOutput=journal
+StandardError=journal

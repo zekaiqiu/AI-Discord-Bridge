@@ -1,0 +1,21 @@
+# Build context exclusions. Frontend stage 1 needs frontend/src + frontend/package*.json; runtime stage only needs the built static/.
+#
+# Notes:
+# - frontend/ is INTENTIONALLY not excluded — stage 1 of Dockerfile uses it.
+# - static/ is INTENTIONALLY not excluded; the multi-stage build copies the
+#   freshly-built static/ from --from=frontend, so any host-built static/
+#   that sneaks into the build context is harmlessly overwritten in stage 2.
+# - tests/ and conftest.py ARE excluded; tests run on the host against the
+#   source tree, not inside the production image.
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+tests/
+conftest.py
+*.md
+.env
+.env.*
+node_modules/
+frontend/node_modules/
+frontend/dist/

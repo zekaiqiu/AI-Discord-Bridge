@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>dev</title>
+    <script>
+      // Replace the static fallback title with the live host so the
+      // browser tab reads "dev.<your tenant>" rather than a fixed
+      // tenant name. Done in a tiny inline script so the title is
+      // correct before the SPA bundle even parses.
+      try { document.title = "dev." + (location.host.replace(/^dev\./, "")); } catch (e) {}
+      // Wizerith-only theme loader — see chat/frontend/index.html for
+      // the full rationale. Sets data-tenant=wizerith synchronously so
+      // the theme CSS applies during first paint, then injects the
+      // shared topbar via /_theme/wizerith-theme.js. ald3 hosts skip
+      // this entirely.
+      try {
+        var h = location.hostname;
+        if (h === 'wizerith.ai' || h.endsWith('.wizerith.ai')) {
+          document.documentElement.setAttribute('data-tenant', 'wizerith');
+          // FOUC fix: document.write the stylesheet so it is render-blocking
+          // during parse (no flash of un-themed colors). Host-guarded +
+          // document.write rather than a static <link> because dev also
+          // serves ald3 hosts where /_theme/* 404s. Cache-bust dropped —
+          // see chat/frontend/index.html for the full rationale.
+          document.write('<link rel="stylesheet" href="/_theme/wizerith-theme.css">');
+          var s = document.createElement('script');
+          s.src = '/_theme/wizerith-theme.js'; s.async = false;
+          document.head.appendChild(s);
+        }
+      } catch (e) {}
+    </script>
+    <link rel="icon" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext x='8' y='13' font-size='13' text-anchor='middle' font-family='monospace'%3E%E2%96%B6%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

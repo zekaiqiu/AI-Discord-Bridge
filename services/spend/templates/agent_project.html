@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ detail.id }} · agents · cost.ald3.com</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>spend</h1>
+  <nav>
+    <a href="/">cost</a>
+    <a href="/agents" class="cur">agents</a>
+  </nav>
+  <span class="who">{{ user_email }}</span>
+</header>
+
+<main>
+
+<section class="card">
+  <h2>
+    <a href="/agents" style="color:var(--muted);text-decoration:none">←</a>
+    {{ detail.id }}
+    {% if detail.has_orchestrator_pid %}<span class="flag run badge">running</span>{% endif %}
+    {% if detail.is_paused %}<span class="flag pause badge">paused</span>{% endif %}
+    {% if detail.is_rate_limited %}<span class="flag rl badge">rate-limited</span>{% endif %}
+  </h2>
+  <div class="kvs" id="head-kvs">
+    <div><span class="k">phase</span><span class="v" id="hk-phase">{{ detail.pending.phase | default('—') }}</span></div>
+    <div><span class="k">step</span><span class="v" id="hk-step">{{ detail.pending.step | default('—') }}</span></div>
+    <div><span class="k">role</span><span class="v" id="hk-role">{{ detail.pending.role | default('—') }}</span></div>
+    <div><span class="k">total cost</span><span class="v" id="hk-cost">${{ '%.4f'|format(detail.total_cost_usd) }}</span></div>
+    <div><span class="k">total calls</span><span class="v" id="hk-calls">{{ detail.recent_invokes | length }}+</span></div>
+  </div>
+
+  <h2 style="margin-top:18px">phase steps</h2>
+  <div class="steps" id="step-tree">
+    {% for s in detail.phase_steps if s != 'done' %}
+      <span class="step {% if s == detail.pending.step %}cur{% endif %}" data-step="{{ s }}">{{ s }}</span>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>per-role totals</h2>
+  <table class="quotas">
+    <thead><tr><th>role</th><th>calls</th><th>in</th><th>out</th><th>cache w/r</th><th>USD</th><th>models</th></tr></thead>
+    <tbody id="role-tbody">
+      {% for r in detail.role_totals %}
+        <tr>
+          <td>{{ r.role }}</td>
+          <td>{{ r.calls }}</td>
+          <td>{{ '{:,}'.format(r.input_tokens) }}</td>
+          <td>{{ '{:,}'.format(r.output_tokens) }}</td>
+          <td>{{ '{:,}'.format(r.cache_creation_input_tokens) }} / {{ '{:,}'.format(r.cache_read_input_tokens) }}</td>
+          <td>${{ '%.4f'|format(r.cost_usd) }}</td>
+          <td class="muted small">{{ r.models | join(', ') }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="muted">no token records yet</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>per-phase cost</h2>
+  <table class="quotas">
+    <thead><tr><th>phase</th><th>USD</th></tr></thead>
+    <tbody id="phase-tbody">
+      {% for p in detail.cost_by_phase %}
+        <tr><td>{{ p.phase | default('(unphased)') }}</td><td>${{ '%.4f'|format(p.cost_usd) }}</td></tr>
+      {% else %}
+        <tr><td colspan="2" class="muted">no records yet</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>recent events</h2>
+  <div class="events" id="events">
+    {% for e in detail.events | reverse %}
+      <div class="ev {{ e.type }}">
+        <span class="et">{{ '%.0f'|format(e.ts) }}</span>
+        <span class="typ">{{ e.type }}</span>
+        <span class="muted small">
+          {%- for k, v in e.items() if k not in ['ts','type'] -%}
+            {{ k }}={{ v }}{{ ' ' if not loop.last }}
+          {%- endfor -%}
+        </span>
+      </div>
+    {% else %}
+      <div class="muted">no events yet (orchestrator hasn't started or pre-dates the events feature)</div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>recent invocations (token log)</h2>
+  <table class="quotas">
+    <thead><tr><th>ts</th><th>phase</th><th>role</th><th>step</th><th>model</th><th>in</th><th>out</th><th>cache w/r</th></tr></thead>
+    <tbody>
+      {% for r in detail.recent_invokes %}
+        <tr>
+          <td class="muted small">{{ '%.0f'|format(r.ts) }}</td>
+          <td>{{ r.phase | default('—') }}</td>
+          <td>{{ r.agent_role }}</td>
+          <td>{{ r.step }}</td>
+          <td class="muted small">{{ r.model }}</td>
+          <td>{{ '{:,}'.format(r.input_tokens) }}</td>
+          <td>{{ '{:,}'.format(r.output_tokens) }}</td>
+          <td>{{ '{:,}'.format(r.cache_creation_input_tokens) }} / {{ '{:,}'.format(r.cache_read_input_tokens) }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="8" class="muted">no calls yet</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% if detail.transcripts %}
+<section class="card" id="transcripts">
+  <h2>inter-agent transcripts</h2>
+  <p class="muted small">click a role to load and expand its conversation history</p>
+  <div class="transcript-list">
+    {% for t in detail.transcripts %}
+      <details class="transcript" data-role="{{ t.role }}">
+        <summary>
+          <span class="role-name">{{ t.role }}</span>
+          <span class="muted small">{{ t.messages }} msg · {{ '%.1f'|format(t.size_bytes / 1024) }} KiB</span>
+        </summary>
+        <div class="transcript-body" data-loaded="false">
+          <div class="muted small">loading…</div>
+        </div>
+      </details>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if detail.initial_brief %}
+<section class="card">
+  <h2>initial brief</h2>
+  <div class="brief">{{ detail.initial_brief }}</div>
+</section>
+{% endif %}
+
+</main>
+
+<script>
+const PROJECT_ID = {{ detail.id | tojson }};
+
+// Live refresh — re-fetch every 5s, update headline + step tree.
+async function tick() {
+  try {
+    const r = await fetch(`/api/agents/project/${PROJECT_ID}`, {credentials: 'same-origin'});
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById('hk-phase').textContent = d.pending.phase ?? '—';
+    document.getElementById('hk-step').textContent = d.pending.step ?? '—';
+    document.getElementById('hk-role').textContent = d.pending.role ?? '—';
+    document.getElementById('hk-cost').textContent = '$' + d.total_cost_usd.toFixed(4);
+    document.querySelectorAll('#step-tree .step').forEach(el => {
+      el.classList.toggle('cur', el.dataset.step === d.pending.step);
+    });
+  } catch (_) {}
+}
+setInterval(tick, 5000);
+
+// Lazy-load transcripts on first expand.
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+async function loadTranscript(detailEl) {
+  const role = detailEl.dataset.role;
+  const body = detailEl.querySelector('.transcript-body');
+  if (body.dataset.loaded === 'true') return;
+  body.dataset.loaded = 'true';
+  body.innerHTML = '<div class="muted small">loading…</div>';
+  try {
+    const r = await fetch(
+      `/api/agents/project/${PROJECT_ID}/transcript/${encodeURIComponent(role)}`,
+      {credentials: 'same-origin'}
+    );
+    if (!r.ok) {
+      body.innerHTML = `<div class="err">load failed: HTTP ${r.status}</div>`;
+      return;
+    }
+    const d = await r.json();
+    let html = '';
+    if (d.omitted_oldest) {
+      html += `<div class="muted small">omitting ${d.omitted_oldest} older messages</div>`;
+    }
+    for (const m of d.messages) {
+      const cls = m.role === 'assistant' ? 'msg msg-asst' : 'msg msg-user';
+      const trunc = m.truncated ? '<div class="muted small">[truncated]</div>' : '';
+      html += `<div class="${cls}"><div class="msg-role">${escapeHtml(m.role)}</div>`
+            + `<pre class="msg-content">${escapeHtml(m.content || '')}</pre>${trunc}</div>`;
+    }
+    if (!d.messages.length) html += '<div class="muted small">empty session</div>';
+    body.innerHTML = html;
+  } catch (e) {
+    body.innerHTML = `<div class="err">load failed: ${escapeHtml(e.message)}</div>`;
+  }
+}
+document.querySelectorAll('details.transcript').forEach(el => {
+  el.addEventListener('toggle', () => { if (el.open) loadTranscript(el); });
+});
+</script>
+</body>
+</html>

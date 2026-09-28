@@ -1,0 +1,53 @@
+# Quant / data-science deps installed into the chat image's site-packages so
+# the per-user container (which reuses portfolio-tool/chat:dev) can `import`
+# them without a per-session pip install. The chat backend itself doesn't
+# import any of these — they're here for the claude-driven research path
+# (host / user-container / local dispatch) only.
+#
+# Kept in a separate file from requirements.txt so a chat-backend-only dep
+# bump doesn't invalidate this layer's cache (which costs ~minutes to
+# rebuild because of vectorbt's numba/llvmlite chain).
+
+# --- Foundation: numerics, dataframes, plotting ------------------------------
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+scipy>=1.11,<2.0
+matplotlib>=3.8,<4.0
+seaborn>=0.13,<1.0
+plotly>=5.20,<7.0
+statsmodels>=0.14,<1.0
+scikit-learn>=1.4,<2.0
+
+# --- Data formats / fast SQL -------------------------------------------------
+pyarrow>=15.0,<22.0
+duckdb>=1.0,<2.0
+openpyxl>=3.1,<4.0
+xlsxwriter>=3.1,<4.0
+fastparquet>=2024.0
+
+# --- Market-data sources -----------------------------------------------------
+yfinance>=0.2.40
+pandas-datareader>=0.10
+# FRED — US/global macro series (rates, inflation, employment, GDP, spreads).
+# Free API key required; set FRED_API_KEY in the per-user container env.
+# Usage: `from fredapi import Fred; Fred().get_series('UNRATE')`.
+fredapi>=0.5
+
+# --- Quant analytics / TA / metrics ------------------------------------------
+pandas-ta>=0.3.14b0
+empyrical-reloaded>=0.5.10
+quantstats>=0.0.62
+
+# --- Backtesting -------------------------------------------------------------
+vectorbt>=0.26
+backtesting>=0.3.3
+
+# --- Broker / exchange clients ----------------------------------------------
+ccxt>=4.3
+alpaca-py>=0.20
+polygon-api-client>=1.13
+
+# --- Reporting / PDF ---------------------------------------------------------
+# weasyprint pulled in for tearsheet PDF rendering downstream of quantstats.
+weasyprint>=62
+reportlab>=4.0

@@ -1,0 +1,23 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+httpx==0.28.1
+python-jose[cryptography]==3.3.0
+python-multipart==0.0.20
+pytest==8.3.4
+# pytest-asyncio: forward-provision for Phase 2 SSE / async-claude tests.
+pytest-asyncio==0.25.0
+# docker: per-user container provisioning (services.chat.user_container).
+# Pinned to the docker-py 7.x line; 8.x renames a couple of the SDK exception
+# classes user_container.py catches by name.
+docker>=7.0.0,<8.0.0
+# PyJWT: used by services.chat.auth.verify_cf_access_jwt (the new multi-user
+# JWT verifier) and by services.term-router which imports the same module.
+# Distinct from python-jose above, which the legacy verify_jwt path uses;
+# see auth.py for why both libs coexist.
+PyJWT[crypto]>=2.8,<3.0
+# bcrypt: password hashing for the local email+password auth path
+# (services/chat/local_auth.py). Only imported when AUTH_MODE=local (chat.ald3
+# side); chat-wizerith never loads local_auth so the dep is dormant there.
+bcrypt>=4.0,<5.0
+# email-validator: pydantic.EmailStr in local_auth_routes.py requires this.
+email-validator>=2.0,<3.0

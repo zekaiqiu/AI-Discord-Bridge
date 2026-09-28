@@ -1,0 +1,21 @@
+# secrets / local config
+.env
+
+# python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.coverage
+
+# local runtime state
+work/
+
+# backup droppings
+*.bak*
+
+# node
+node_modules/
+dist/

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Disable pinch-zoom on mobile so the toolbar / file-tree splitters
+         don't slide off-screen. The terminal is a fixed-layout app. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>term</title>
+    <script>
+      // Same image serves every tenant. Set the window title from the
+      // current host so users see their own brand.
+      document.title = location.host;
+    </script>
+    <!-- Apply theme synchronously before paint so there's no flash of dark/light. -->
+    <script>
+      (function () {
+        var t = (function () {
+          try { return localStorage.getItem("termTheme"); } catch (_) { return null; }
+        })() || "dark";
+        document.documentElement.setAttribute("data-theme", t);
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/xterm.css?v=8" />
+    <link rel="stylesheet" href="/static/codemirror/codemirror.css?v=8" />
+    <link rel="stylesheet" href="/static/codemirror/theme/darcula.css?v=8" />
+    <link rel="stylesheet" href="/static/term.css?v=9" />
+  </head>
+  <body>
+    <header id="topbar">
+      <div class="brand" id="brand"></div>
+      <!-- Workspace toggle. Hidden by default; term.js shows it iff the
+           tenant has a shared container configured (probed via /api/me
+           on load). Toggling sets the chat_workspace cookie and
+           reconnects the WS into the new container. -->
+      <div id="workspace-toggle" class="workspace-toggle" role="radiogroup" aria-label="Workspace" hidden>
+        <button type="button" class="workspace-opt" data-workspace="personal" role="radio" aria-checked="true">Personal</button>
+        <button type="button" class="workspace-opt" data-workspace="shared" role="radio" aria-checked="false">Shared</button>
+      </div>
+      <div class="topbar-right">
+        <button id="theme-toggle" class="icon-btn theme-toggle" type="button"
+                title="Toggle theme" aria-label="Toggle theme">☾</button>
+        <div id="conn" class="conn">connecting…</div>
+      </div>
+    </header>
+    <script>
+      document.getElementById("brand").textContent = location.host;
+    </script>
+
+    <main id="layout">
+      <aside id="sidebar">
+        <div class="sidebar-head">
+          <div class="path-row">
+            <button id="up-btn" class="icon-btn" title="Up one directory" aria-label="Up">↑</button>
+            <input id="path" type="text" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="action-row" role="toolbar" aria-label="File actions">
+            <button id="new-file-btn" class="icon-btn" title="New file" aria-label="New file">＋</button>
+            <button id="new-folder-btn" class="icon-btn" title="New folder" aria-label="New folder">▢</button>
+            <label class="icon-btn upload-btn" title="Upload file" aria-label="Upload file">
+              ⤒
+              <input id="upload-input" type="file" multiple hidden />
+            </label>
+            <span class="action-sep" aria-hidden="true"></span>
+            <button id="new-project-btn" class="icon-btn" title="New project in IDE" aria-label="New project">⊕</button>
+            <button id="open-project-btn" class="icon-btn" title="Open project in IDE" aria-label="Open project">⤴</button>
+            <button id="refresh-btn" class="icon-btn" title="Refresh" aria-label="Refresh">↻</button>
+          </div>
+          <div class="search-row">
+            <span class="search-icon" aria-hidden="true">⌕</span>
+            <input id="search" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="Search files by name…" aria-label="Search files" />
+            <button id="search-clear" class="icon-btn search-clear" type="button"
+                    title="Clear search" aria-label="Clear search" hidden>×</button>
+          </div>
+        </div>
+        <ul id="filelist" class="filelist" aria-live="polite"></ul>
+        <ul id="search-results" class="filelist search-results" aria-live="polite" hidden></ul>
+        <div id="drop-zone" class="drop-zone" aria-label="drop files here to upload">
+          <span class="drop-zone-icon" aria-hidden="true">⤓</span>
+          <span class="drop-zone-text">drop files here to upload</span>
+        </div>
+        <div id="upload-progress" class="upload-progress" hidden></div>
+      </aside>
+
+      <div id="resizer" role="separator" aria-orientation="vertical"></div>
+
+      <section id="rightpane">
+        <div id="termpane">
+          <div id="terminal"></div>
+        </div>
+
+        <div id="vresizer" role="separator" aria-orientation="horizontal" title="drag to resize"></div>
+
+        <section id="viewerpane">
+          <header id="viewer-head">
+            <span id="viewer-title" class="viewer-title">Open a file from the sidebar to view or edit</span>
+            <span id="viewer-status" class="viewer-status"></span>
+            <span class="viewer-actions">
+              <button id="viewer-save" class="text-btn" hidden>Save (⌘S)</button>
+              <a id="viewer-download" class="text-btn" hidden>Download</a>
+              <button id="viewer-close" class="icon-btn" title="close" aria-label="close" hidden>✕</button>
+            </span>
+          </header>
+          <div id="viewer-body" class="viewer-body">
+            <div class="viewer-empty">No file open.</div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div id="status" hidden></div>
+
+    <script src="/static/xterm.js?v=8"></script>
+    <!-- CodeMirror 5: core + extension→mode metadata, then foundation
+         modes (xml/javascript/css), then composite (htmlmixed/jsx) +
+         the rest, then addons. Order matters because modes depend on
+         each other and addons depend on the core having loaded. -->
+    <script src="/static/codemirror/codemirror.js?v=8"></script>
+    <script src="/static/codemirror/mode/meta.js?v=8"></script>
+    <script src="/static/codemirror/mode/xml.js?v=8"></script>
+    <script src="/static/codemirror/mode/javascript.js?v=8"></script>
+    <script src="/static/codemirror/mode/css.js?v=8"></script>
+    <script src="/static/codemirror/mode/htmlmixed.js?v=8"></script>
+    <script src="/static/codemirror/mode/jsx.js?v=8"></script>
+    <script src="/static/codemirror/mode/python.js?v=8"></script>
+    <script src="/static/codemirror/mode/shell.js?v=8"></script>
+    <script src="/static/codemirror/mode/yaml.js?v=8"></script>
+    <script src="/static/codemirror/mode/markdown.js?v=8"></script>
+    <script src="/static/codemirror/mode/sql.js?v=8"></script>
+    <script src="/static/codemirror/mode/dockerfile.js?v=8"></script>
+    <script src="/static/codemirror/mode/toml.js?v=8"></script>
+    <script src="/static/codemirror/mode/rust.js?v=8"></script>
+    <script src="/static/codemirror/mode/go.js?v=8"></script>
+    <script src="/static/codemirror/mode/properties.js?v=8"></script>
+    <script src="/static/codemirror/addon/active-line.js?v=8"></script>
+    <script src="/static/codemirror/addon/matchbrackets.js?v=8"></script>
+    <script src="/static/codemirror/addon/closebrackets.js?v=8"></script>
+    <script src="/static/codemirror/addon/xml-fold.js?v=8"></script>
+    <script src="/static/codemirror/addon/matchtags.js?v=8"></script>
+    <script src="/static/codemirror/addon/trailingspace.js?v=8"></script>
+    <script src="/static/files.js?v=9"></script>
+    <script src="/static/viewer.js?v=8"></script>
+    <script src="/static/term.js?v=9"></script>
+  </body>
+</html>

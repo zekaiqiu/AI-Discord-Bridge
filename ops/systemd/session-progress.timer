@@ -1,0 +1,19 @@
+[Unit]
+Description=10-minute progress reports on working sessions
+# NOTE: deliberately no `Requires=session-progress.service`. systemd derives
+# the unit to run from the timer's own name, and a Requires= here would pull
+# the service in every time the TIMER is activated — i.e. an extra report on
+# every `enable` and every `daemon-reload`. Harmless for a quiet hourly alarm
+# (wake-watchdog.timer keeps it, matching house style), but this one speaks
+# every 10 minutes and those spurious runs would be pure noise.
+
+[Timer]
+# Every 10 minutes, offset off :00 — the wake chains and the hourly
+# stall-watchdog already cluster on round offsets, and a progress read taken
+# in the same second a wake is mid-claim reports a misleading "no wake".
+OnCalendar=*:03/10
+Persistent=false
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

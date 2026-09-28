@@ -1,0 +1,197 @@
+#!/usr/local/bin/python3
+"""tearsheet — turn a returns series into a quantstats PDF report.
+
+Reads a returns column from CSV / parquet / feather, fetches benchmark
+returns via yfinance (default SPY), and renders a quantstats HTML report
+which is then converted to PDF via weasyprint. One artifact in, one
+artifact out — the chat UI's PDF renderer takes it inline from there.
+
+Usage:
+  tearsheet returns.parquet
+  tearsheet returns.csv --benchmark QQQ --out my_strat.pdf --title "L/S Tech"
+
+Input shapes accepted:
+  - single-column dataframe of period returns (decimal, not pct)
+  - column named one of: returns, ret, r, pnl_pct, daily_return
+  - first column with a numeric dtype if no name match
+Index is parsed as a DatetimeIndex if the file has one; otherwise we
+treat rows as business-day spaced from today backwards.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+
+_RETURN_COL_CANDIDATES = (
+    "returns", "return", "ret", "r",
+    "daily_return", "daily_returns",
+    "pnl_pct", "pct_change", "strategy",
+)
+
+
+def _read_returns(path: Path) -> pd.Series:
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        df = pd.read_parquet(path)
+    elif suffix in (".feather", ".arrow"):
+        df = pd.read_feather(path)
+    elif suffix in (".csv", ".tsv"):
+        sep = "\t" if suffix == ".tsv" else ","
+        df = pd.read_csv(path, sep=sep)
+    elif suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(path)
+    else:
+        raise SystemExit(f"unsupported input extension: {suffix}")
+
+    # If the first column looks like a date, promote it to the index.
+    if not isinstance(df.index, pd.DatetimeIndex) and len(df.columns):
+        first = df.columns[0]
+        try:
+            parsed = pd.to_datetime(df[first], errors="raise")
+            df = df.set_index(parsed).drop(columns=[first])
+        except (ValueError, TypeError):
+            pass
+
+    # If the index isn't datetime-typed, synthesize a business-day index
+    # ending today so quantstats can still bucket monthly/yearly.
+    if not isinstance(df.index, pd.DatetimeIndex):
+        idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=len(df))
+        df.index = idx
+
+    # Pick a return column.
+    col = None
+    for c in df.columns:
+        if str(c).lower() in _RETURN_COL_CANDIDATES:
+            col = c
+            break
+    if col is None:
+        # Fall back to the first numeric column.
+        for c in df.columns:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                col = c
+                break
+    if col is None:
+        raise SystemExit(
+            "no numeric returns column found; expected one of "
+            f"{list(_RETURN_COL_CANDIDATES)} or any numeric column"
+        )
+
+    s = df[col].astype(float).dropna()
+    s.index = pd.DatetimeIndex(s.index).tz_localize(None)
+    s.name = "returns"
+    return s.sort_index()
+
+
+def _maybe_decimalize(returns: pd.Series) -> pd.Series:
+    """If the input looks like percentages (e.g. 1.5 for 1.5%), divide by 100.
+
+    Heuristic: if abs(median) > 1.0 the user almost certainly handed us
+    percentage-quoted returns. Real daily returns are well under 1.0 in
+    decimal form.
+    """
+    if returns.abs().median() > 1.0:
+        return returns / 100.0
+    return returns
+
+
+def _html_to_pdf(html_path: Path, pdf_path: Path) -> None:
+    from weasyprint import HTML
+    HTML(filename=str(html_path)).write_pdf(str(pdf_path))
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="tearsheet", description=__doc__)
+    p.add_argument("returns", help="path to returns file (.parquet/.csv/.tsv/.feather/.xlsx)")
+    p.add_argument(
+        "--benchmark", default="SPY",
+        help="benchmark ticker for yfinance (default: SPY). Pass 'none' to skip.",
+    )
+    p.add_argument(
+        "--out", default=None,
+        help="output PDF path (default: tearsheet.pdf next to the input)",
+    )
+    p.add_argument("--title", default="Strategy Tearsheet")
+    p.add_argument(
+        "--format", choices=("pdf", "html"), default="pdf",
+        help="output format. PDF requires weasyprint; HTML is faster.",
+    )
+    args = p.parse_args(argv)
+
+    in_path = Path(args.returns).expanduser().resolve()
+    if not in_path.exists():
+        raise SystemExit(f"input not found: {in_path}")
+
+    returns = _maybe_decimalize(_read_returns(in_path))
+    if returns.empty:
+        raise SystemExit("returns series is empty after dropna")
+
+    # Default output: <in>.tearsheet.pdf alongside the input.
+    if args.out is None:
+        out = in_path.with_suffix("").with_suffix(f".tearsheet.{args.format}")
+    else:
+        out = Path(args.out).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Quantstats imports matplotlib in a way that warns on missing $DISPLAY;
+    # set the Agg backend explicitly before importing.
+    import matplotlib
+    matplotlib.use("Agg")
+    import quantstats as qs  # noqa: E402
+
+    benchmark = None if args.benchmark.lower() == "none" else args.benchmark
+
+    # quantstats.reports.html writes a complete self-contained HTML doc
+    # with embedded images. We render to a tmp .html either way; for
+    # --format=pdf we then push it through weasyprint.
+    with tempfile.TemporaryDirectory() as tmp:
+        html_path = Path(tmp) / "report.html"
+        try:
+            qs.reports.html(
+                returns, benchmark=benchmark,
+                output=str(html_path),
+                title=args.title,
+                download_filename=str(html_path),
+            )
+        except Exception as exc:
+            # quantstats sometimes fails on benchmark download (yfinance
+            # rate limit, ticker not found). Retry without benchmark.
+            print(
+                f"warning: tearsheet with benchmark={benchmark!r} failed ({exc}); "
+                "retrying without benchmark",
+                file=sys.stderr,
+            )
+            qs.reports.html(
+                returns, benchmark=None,
+                output=str(html_path),
+                title=args.title,
+                download_filename=str(html_path),
+            )
+
+        if args.format == "html":
+            out.write_bytes(html_path.read_bytes())
+        else:
+            try:
+                _html_to_pdf(html_path, out)
+            except Exception as exc:
+                raise SystemExit(
+                    f"weasyprint PDF conversion failed: {exc}\n"
+                    "fallback: rerun with --format=html, or install "
+                    "weasyprint into /usr/local/bin/python3."
+                )
+
+    rel_out = out
+    try:
+        rel_out = out.relative_to(Path.cwd())
+    except ValueError:
+        pass
+    print(f"tearsheet → {rel_out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

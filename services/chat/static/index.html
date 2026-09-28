@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover lets us read env(safe-area-inset-*) in CSS;
+         interactive-widget=resizes-content tells Android Chrome (and
+         compliant browsers) to shrink the layout viewport when the
+         on-screen keyboard opens, instead of overlaying it. iOS Safari
+         ignores this directive and we handle the keyboard there via the
+         visualViewport listener in App.tsx (search for the
+         ``Mobile keyboard / dynamic-chrome height handling`` block). -->
+    <!-- maximum-scale=1 + user-scalable=no disables pinch-zoom on mobile.
+         Reason: zooming pushes the composer's `Image`/`Web search` toggle
+         buttons off-screen and there's no way to zoom back out without
+         losing context. The chat is a fixed-layout app, not a document,
+         so zoom is the wrong gesture here. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Chat</title>
+    <script>
+      // Wizerith-only theme loader. The shared appearance module
+      // (/_theme/wizerith-theme.{css,js}) is served by Caddy on every
+      // wizerith host but NOT on ald3 hosts (see infra/caddy/Caddyfile
+      // @wizerith_theme matcher). We:
+      //   1. Set data-tenant=wizerith on <html> SYNCHRONOUSLY so the
+      //      wizerith theme CSS applies during the first paint instead
+      //      of waiting for the deferred theme.js to run.
+      //   2. Inject the theme CSS + JS into <head>. The JS appends the
+      //      shared topbar (Home / Chat / Dev / Drive + workspace
+      //      toggle + appearance settings + user pill) above the SPA.
+      //   3. async=false makes the dynamically-inserted script execute
+      //      after the main React bundle, which lets the topbar know
+      //      whether the user is signed in (chat /api/auth/me has
+      //      returned by then).
+      try {
+        var h = location.hostname;
+        if (h === 'wizerith.ai' || h.endsWith('.wizerith.ai')) {
+          document.documentElement.setAttribute('data-tenant', 'wizerith');
+          // FOUC fix: emit the theme stylesheet with document.write so it
+          // is render-blocking during the initial parse. A JS-appended
+          // <link> resolves *after* the first paint, so the page flashed
+          // un-themed fallback colors for one frame (worst in incognito +
+          // CF dev mode, where no warm cache softened the race). We can't
+          // use a plain static <link> here because chat/dev also serve
+          // ald3 hosts, where /_theme/* 404s — hence the host guard plus
+          // document.write. No ?v= cache-bust: it forced a fresh network
+          // fetch on every load (which guaranteed the flash); Caddy already
+          // serves theme.css with `max-age=30`, so edits propagate in ~30s.
+          document.write('<link rel="stylesheet" href="/_theme/wizerith-theme.css">');
+          // Topbar JS stays JS-injected with async=false so it executes
+          // after the React bundle and can read the signed-in state.
+          var s = document.createElement('script');
+          s.src = '/_theme/wizerith-theme.js'; s.async = false;
+          document.head.appendChild(s);
+        }
+      } catch (e) {}
+    </script>
+    <script type="module" crossorigin src="/assets/index-BmrYkRM2.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-zlsgBdiv.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

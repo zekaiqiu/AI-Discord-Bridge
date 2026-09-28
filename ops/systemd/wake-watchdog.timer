@@ -1,0 +1,15 @@
+[Unit]
+Description=Hourly liveness check on scheduled-wake chains
+Requires=wake-watchdog.service
+
+[Timer]
+OnBootSec=3min
+# Hourly, at :37 rather than :00 — the wake chains themselves cluster on
+# round offsets, and checking a session in the same minute its own wake is
+# firing reads as "no pending wake" mid-claim and would trip a false STALLED.
+OnCalendar=*:37
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

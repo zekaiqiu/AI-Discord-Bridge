@@ -1,0 +1,35 @@
+{
+  "name": "chat-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "check:merge": "esbuild tests/messageMerge.check.ts --bundle --platform=node --format=cjs --outfile=node_modules/.cache/messageMerge.check.cjs --log-level=error && node node_modules/.cache/messageMerge.check.cjs"
+  },
+  "dependencies": {
+    "apache-arrow": "^17.0.0",
+    "hyparquet": "^1.10.0",
+    "katex": "^0.16.11",
+    "mermaid": "^10.9.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "react-syntax-highlighter": "^15.6.1",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.0",
+    "remark-math": "^6.0.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/react-syntax-highlighter": "^15.5.13",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

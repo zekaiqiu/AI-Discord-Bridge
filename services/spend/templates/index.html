@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>spend · cost.ald3.com</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>spend</h1>
+  <nav>
+    <a href="/" class="cur">cost</a>
+    <a href="/agents">agents</a>
+  </nav>
+  <span class="who">{{ user_email }}</span>
+</header>
+
+<main>
+
+<section class="card" id="anthropic">
+  <h2>Anthropic</h2>
+  {% if anthropic_err %}
+    <p class="err">{{ anthropic_err }}</p>
+  {% elif anthropic %}
+    <table class="quotas">
+      <thead><tr><th>account</th><th>5h</th><th>7d</th><th>extra usage</th></tr></thead>
+      <tbody>
+      {% for acct in anthropic.accounts %}
+        <tr class="{% if acct.is_active %}active{% endif %}">
+          <td>
+            {{ acct.name }}{% if acct.is_active %} <span class="badge">active</span>{% endif %}
+            {% if not acct.available %}<br><span class="muted">{{ acct.error or 'unavailable' }}</span>{% endif %}
+          </td>
+          {% set w5h = acct.windows | selectattr('label','equalto','5h') | list | first %}
+          {% set w7d = acct.windows | selectattr('label','equalto','7d') | list | first %}
+          <td>
+            {% if w5h %}
+              <div class="bar"><span style="width:{{ w5h.utilization }}%"></span></div>
+              <span class="num">{{ '%.1f'|format(w5h.utilization) }}%</span>
+              <div class="muted small">resets in {{ fmt_minutes(w5h.resets_in_minutes) }}</div>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if w7d %}
+              <div class="bar"><span style="width:{{ w7d.utilization }}%"></span></div>
+              <span class="num">{{ '%.1f'|format(w7d.utilization) }}%</span>
+              <div class="muted small">resets in {{ fmt_minutes(w7d.resets_in_minutes) }}</div>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if acct.extra_usage %}
+              ${{ '%.2f'|format(acct.extra_usage.used_credits or 0) }} / ${{ '%.0f'|format(acct.extra_usage.monthly_limit or 0) }}
+              <span class="muted small">{{ acct.extra_usage.currency or 'USD' }}</span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="kvs">
+      <div><span class="k">today UTC ({{ anthropic.today_utc.date or '—' }})</span><span class="v">${{ '%.2f'|format(anthropic.today_utc.total_cost_usd) }}</span></div>
+      {% if anthropic.active_block %}
+        <div><span class="k">active 5h block</span><span class="v">
+          ${{ '%.2f'|format(anthropic.active_block.cost_usd_so_far or 0) }} so far
+          {% if anthropic.active_block.projected_cost_usd %}· proj ${{ '%.2f'|format(anthropic.active_block.projected_cost_usd) }}{% endif %}
+          {% if anthropic.active_block.remaining_minutes %}· {{ fmt_minutes(anthropic.active_block.remaining_minutes) }} left{% endif %}
+        </span></div>
+      {% endif %}
+      <div><span class="k">{{ anthropic.rolling_5d.days }}d rolling</span><span class="v">${{ '%.2f'|format(anthropic.rolling_5d.cost_usd) }} · {{ '{:,}'.format(anthropic.rolling_5d.tokens) }} tok</span></div>
+    </div>
+  {% else %}
+    <p class="muted">no data</p>
+  {% endif %}
+</section>
+
+<section class="card" id="aws">
+  <h2>AWS</h2>
+  {% if aws_err %}
+    <p class="err">{{ aws_err }}</p>
+  {% elif aws %}
+    <div class="kvs">
+      <div><span class="k">month-to-date</span><span class="v">${{ '%.2f'|format(aws.month_to_date_usd) }}</span></div>
+      <div><span class="k">prev month total</span><span class="v">${{ '%.2f'|format(aws.prev_month_usd) }}</span></div>
+      <div><span class="k">as of</span><span class="v">{{ aws.as_of }}</span></div>
+    </div>
+    <table class="quotas">
+      <thead><tr><th>service</th><th>USD</th></tr></thead>
+      <tbody>
+        {% for s in aws.by_service %}
+          <tr><td>{{ s.service }}</td><td>${{ '%.2f'|format(s.cost_usd) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">no data</p>
+  {% endif %}
+</section>
+
+</main>
+</body>
+</html>

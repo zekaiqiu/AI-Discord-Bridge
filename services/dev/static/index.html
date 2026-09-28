@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>dev</title>
+    <script>
+      // Replace the static fallback title with the live host so the
+      // browser tab reads "dev.<your tenant>" rather than a fixed
+      // tenant name. Done in a tiny inline script so the title is
+      // correct before the SPA bundle even parses.
+      try { document.title = "dev." + (location.host.replace(/^dev\./, "")); } catch (e) {}
+    </script>
+    <link rel="icon" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext x='8' y='13' font-size='13' text-anchor='middle' font-family='monospace'%3E%E2%96%B6%3C/text%3E%3C/svg%3E" />
+    <script type="module" crossorigin src="/assets/index-DjD_82kS.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/monaco-YWDMqL3T.js">
+    <link rel="modulepreload" crossorigin href="/assets/react-C6uBcc2e.js">
+    <link rel="stylesheet" crossorigin href="/assets/monaco-DNlu4krO.css">
+    <link rel="stylesheet" crossorigin href="/assets/index-B1I3hYBp.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

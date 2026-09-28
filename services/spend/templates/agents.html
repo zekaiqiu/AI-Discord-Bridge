@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agents · cost.ald3.com</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>spend</h1>
+  <nav>
+    <a href="/">cost</a>
+    <a href="/agents" class="cur">agents</a>
+  </nav>
+  <span class="who">{{ user_email }}</span>
+</header>
+
+<main>
+
+<section class="card" id="agents-overview">
+  <h2>multi-agent pipeline</h2>
+  <div id="active-banner" class="muted small" style="margin-bottom:10px">…</div>
+  <div id="proj-list">
+    <div class="proj-row" style="font-weight:600;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em">
+      <span>project</span>
+      <span>phase</span>
+      <span>step</span>
+      <span>calls</span>
+      <span>cost</span>
+      <span>last</span>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<script>
+(async function () {
+  const $ = sel => document.querySelector(sel);
+  const fmtTimeAgo = secs => {
+    if (!secs) return '—';
+    const d = Math.max(0, Date.now()/1000 - secs);
+    if (d < 60) return `${Math.floor(d)}s`;
+    if (d < 3600) return `${Math.floor(d/60)}m`;
+    if (d < 86400) return `${Math.floor(d/3600)}h`;
+    return `${Math.floor(d/86400)}d`;
+  };
+  const fmtUsd = n => n == null ? '—' : '$' + n.toFixed(2);
+
+  async function refresh () {
+    let data;
+    try {
+      const r = await fetch('/api/agents/overview', {credentials: 'same-origin'});
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      data = await r.json();
+    } catch (e) {
+      $('#active-banner').textContent = 'fetch error: ' + e.message;
+      return;
+    }
+
+    const banner = data.active_project_id
+      ? `active project: <a href="/agents/${data.active_project_id}" style="color:var(--acc)">${data.active_project_id}</a>`
+      : 'no active project';
+    $('#active-banner').innerHTML = banner;
+
+    const list = $('#proj-list');
+    // Drop all rows except header
+    list.querySelectorAll('.proj-row:not(:first-child)').forEach(r => r.remove());
+    for (const p of data.projects) {
+      const row = document.createElement('div');
+      row.className = 'proj-row';
+      const flags = [];
+      if (p.has_orchestrator_pid) flags.push('<span class="flag run">running</span>');
+      if (p.is_paused) flags.push('<span class="flag pause">paused</span>');
+      if (p.is_rate_limited) flags.push('<span class="flag rl">rate-limited</span>');
+      row.innerHTML = `
+        <span><a class="pid" href="/agents/${p.id}">${p.id}</a>${flags.join('')}</span>
+        <span>${p.phase ?? '—'}</span>
+        <span>${p.step ?? '—'}${p.active_role ? ' / ' + p.active_role : ''}</span>
+        <span>${p.calls}</span>
+        <span>${fmtUsd(p.cost_usd)}</span>
+        <span class="muted small">${fmtTimeAgo(p.last_activity)}</span>`;
+      list.appendChild(row);
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
+</body>
+</html>
