@@ -160,3 +160,29 @@ def test_sink_blackhole_still_wins(cfg, monkeypatch):
     asyncio.run(_drive(sink, [("thinking", "hidden"), ("text", "also hidden")]))
     assert sink.has_sent is False
     assert ch.sent == []
+
+
+
+def test_tool_narration_hidden_by_default(cfg, monkeypatch):
+    monkeypatch.setattr(bot, "_is_private_channel", lambda ch: True)
+    monkeypatch.setattr(bot, "SHOW_TOOL_USE", False)
+    ch = FakeChannel()
+    sink = bot.StreamSink(ch, verbose=True)
+    asyncio.run(
+        _drive(sink, [("tool", "using tool: `Bash`\n"), ("text", "the answer")])
+    )
+    shown = sink.live_content or "".join(ch.sent)
+    assert "using tool" not in shown and "🔧" not in shown
+    assert "the answer" in shown
+
+
+def test_tool_narration_can_be_re_enabled(cfg, monkeypatch):
+    monkeypatch.setattr(bot, "_is_private_channel", lambda ch: True)
+    monkeypatch.setattr(bot, "SHOW_TOOL_USE", True)
+    ch = FakeChannel()
+    sink = bot.StreamSink(ch, verbose=True)
+    asyncio.run(
+        _drive(sink, [("tool", "using tool: `Bash`\n"), ("text", "the answer")])
+    )
+    shown = sink.live_content or "".join(ch.sent)
+    assert "using tool: `Bash`" in shown

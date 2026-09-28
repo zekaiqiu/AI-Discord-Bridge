@@ -242,6 +242,9 @@ def set_default_level(level: str) -> None:
 # the model still reasons exactly the same amount — reasoning effort is
 # !effort's job.
 THINKING_LEVELS = ("off", "brief", "full")
+# Tool-use narration ("🔧 using tool: `Bash`") in Discord is hidden by
+# default; set BRIDGE_SHOW_TOOL_USE=1 to bring it back.
+SHOW_TOOL_USE = os.environ.get("BRIDGE_SHOW_TOOL_USE", "").strip().lower() in ("1", "true", "yes")
 DEFAULT_THINKING_LEVEL = "brief"
 THINKING_BRIEF_CHARS = int(os.environ.get("BRIDGE_THINKING_BRIEF_CHARS", "300"))
 
@@ -1840,6 +1843,11 @@ class StreamSink:
         if not self.verbose:
             # Black-hole everything in quiet mode — has_sent stays False so
             # the caller's fallback batch-sender handles the final reply.
+            return
+        if kind == "tool" and not SHOW_TOOL_USE:
+            # Hidden by default (felix, 2026-09-28): the per-call "using tool"
+            # lines are noise in the channel. Dropped without nudging
+            # last_kind so no stray header appears on the next text delta.
             return
         if kind == "thinking":
             if self.thinking_level == "off":

@@ -1270,17 +1270,11 @@ export function App(): JSX.Element {
         next[i] = { ...next[i], content: next[i].content + evt.text };
         return next;
       });
-    } else if (evt.type === "tool_start") {
-      updateMessages(sid, (prev) => {
-        const i = prev.length - 1;
-        if (i < 0 || prev[i].role !== "assistant") return prev;
-        const next = prev.slice();
-        const marker = `\n\n[Tool: ${evt.name}]\n\n`;
-        next[i] = { ...next[i], content: next[i].content + marker };
-        return next;
-      });
-    } else if (evt.type === "tool_end") {
-      /* no-op */
+    } else if (evt.type === "tool_start" || evt.type === "tool_end") {
+      // Tool activity is not rendered into the bubble (the "[Tool: run_bash]"
+      // markers were noise, and they never survived the final text anyway —
+      // done.full_text replaces the streamed content). The streaming
+      // indicator already shows the turn is working.
     } else if (evt.type === "done" || evt.type === "cancelled") {
       updateMessages(sid, (prev) => {
         const i = prev.length - 1;
