@@ -15,6 +15,7 @@
 
 import { AttachmentMeta, Message, ModelChoice, Workspace } from "../api";
 import { useT } from "../i18n";
+import { ThinkingMode, ThinkingModeContext } from "../thinkingMode";
 import { Composer } from "./Composer";
 import { Thread } from "./Thread";
 
@@ -50,6 +51,9 @@ export interface ChatPaneProps {
   /** Stored reasoning-effort level for the pane's model (null = unset). */
   effort: string | null;
   onEffortChange: (level: string | null) => void;
+  /** Thinking-display setting (off / brief / full). Visual only. */
+  thinkingMode: ThinkingMode;
+  onThinkingModeChange: (mode: ThinkingMode) => void;
   webSearchOn: boolean;
   onToggleWebSearch: () => void;
   imageGenOn: boolean;
@@ -82,6 +86,8 @@ export function ChatPane(props: ChatPaneProps): JSX.Element {
     onModelChange,
     effort,
     onEffortChange,
+    thinkingMode,
+    onThinkingModeChange,
     webSearchOn,
     onToggleWebSearch,
     imageGenOn,
@@ -126,12 +132,14 @@ export function ChatPane(props: ChatPaneProps): JSX.Element {
           )}
         </header>
       )}
-      <Thread
-        sessionId={sessionId}
-        messages={messages}
-        streaming={streaming}
-        onForkAndResend={onForkAndResend}
-      />
+      <ThinkingModeContext.Provider value={thinkingMode}>
+        <Thread
+          sessionId={sessionId}
+          messages={messages}
+          streaming={streaming}
+          onForkAndResend={onForkAndResend}
+        />
+      </ThinkingModeContext.Provider>
       <Composer
         draftKey={draftKey}
         // Never hard-disable while streaming: the user can type mid-stream to
@@ -150,6 +158,8 @@ export function ChatPane(props: ChatPaneProps): JSX.Element {
         onModelChange={onModelChange}
         effort={effort}
         onEffortChange={onEffortChange}
+        thinkingMode={thinkingMode}
+        onThinkingModeChange={onThinkingModeChange}
         webSearchOn={webSearchOn}
         onToggleWebSearch={onToggleWebSearch}
         imageGenOn={imageGenOn}

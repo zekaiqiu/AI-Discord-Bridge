@@ -113,6 +113,16 @@ const en: StringsRecord = {
   "composer.pill.effort_aria": "Effort",
   "composer.pill.effort_title": "Reasoning effort for the next message",
   "composer.pill.effort_auto": "Effort: auto",
+  "composer.pill.thinking_aria": "Thinking display",
+  "composer.pill.thinking_title":
+    "How much of the model's thinking to show. Display only — does not change the reasoning effort.",
+  "composer.pill.thinking_off": "Thinking: off",
+  "composer.pill.thinking_brief": "Thinking: brief",
+  "composer.pill.thinking_full": "Thinking: full",
+  "thread.thinking": "Thinking",
+  "thread.thinking_live": "Thinking…",
+  "thread.thinking_expand": "Show full thinking",
+  "thread.thinking_collapse": "Show brief",
   // Oversized pastes become .txt attachments — see limits.ts.
   "composer.paste.converted":
     "That paste was too long for the message box, so it was attached as {filename} ({size}). Claude will read the file.",
@@ -338,6 +348,16 @@ const zhCN: StringsRecord = {
   "composer.pill.effort_aria": "思考力度",
   "composer.pill.effort_title": "下一条消息的推理力度",
   "composer.pill.effort_auto": "力度：自动",
+  "composer.pill.thinking_aria": "思考过程显示",
+  "composer.pill.thinking_title":
+    "显示多少模型的思考过程。仅影响显示，不改变推理力度。",
+  "composer.pill.thinking_off": "思考：隐藏",
+  "composer.pill.thinking_brief": "思考：简要",
+  "composer.pill.thinking_full": "思考：完整",
+  "thread.thinking": "思考过程",
+  "thread.thinking_live": "思考中…",
+  "thread.thinking_expand": "展开完整思考",
+  "thread.thinking_collapse": "收起为简要",
   "composer.paste.converted":
     "粘贴的内容超出消息长度上限，已作为附件 {filename}（{size}）添加。Claude 会读取该文件。",
   "composer.paste.too_many_files":
@@ -559,6 +579,16 @@ const zhTW: StringsRecord = {
   "composer.pill.effort_aria": "思考力度",
   "composer.pill.effort_title": "下一則訊息的推理力度",
   "composer.pill.effort_auto": "力度：自動",
+  "composer.pill.thinking_aria": "思考過程顯示",
+  "composer.pill.thinking_title":
+    "顯示多少模型的思考過程。僅影響顯示，不改變推理力度。",
+  "composer.pill.thinking_off": "思考：隱藏",
+  "composer.pill.thinking_brief": "思考：簡要",
+  "composer.pill.thinking_full": "思考：完整",
+  "thread.thinking": "思考過程",
+  "thread.thinking_live": "思考中…",
+  "thread.thinking_expand": "展開完整思考",
+  "thread.thinking_collapse": "收起為簡要",
   "composer.paste.converted":
     "貼上的內容超出訊息長度上限，已作為附件 {filename}（{size}）加入。Claude 會讀取該檔案。",
   "composer.paste.too_many_files":

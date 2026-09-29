@@ -210,6 +210,27 @@ EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
 }
 
 
+# Hidden-reasoning text persisted per assistant message (``meta.reasoning``)
+# so the thinking block survives a reload. Display-only: how much of it the
+# UI shows is a client setting (off / brief / full) and nothing here changes
+# what is requested from the model. Capped because a 64k-token reasoning
+# trace is ~250 KB and session files are read whole on every poll.
+REASONING_PERSIST_CAP = 120_000
+_REASONING_CAP_NOTE = "\n\n[thinking truncated for storage]"
+
+
+def _capped_reasoning(parts: list[str]) -> str | None:
+    """Join streamed reasoning deltas for persistence, or None if empty."""
+    if not parts:
+        return None
+    text = "".join(parts)
+    if not text.strip():
+        return None
+    if len(text) > REASONING_PERSIST_CAP:
+        text = text[:REASONING_PERSIST_CAP] + _REASONING_CAP_NOTE
+    return text
+
+
 def _validated_effort(model: str | None, effort: str | None) -> str | None:
     """Effort level for ``model`` iff supported and in the level set."""
     if not effort:
@@ -2453,6 +2474,7 @@ async def _consume_into_run(
     email = run.email
     session_id = run.session_id
     assistant_seq = run.assistant_seq
+    reasoning_parts: list[str] = []
     async for event in gen:
         if run.cancel_requested:
             break
@@ -2462,6 +2484,13 @@ async def _consume_into_run(
             if chunk:
                 full_text_parts.append(chunk)
             await run.emit({"type": "delta", "text": chunk})
+        elif et == "reasoning":
+            # Hidden reasoning: streamed for display, persisted on the
+            # message meta at ``done``. Never joins full_text_parts.
+            rchunk = event.get("text") or ""
+            if rchunk:
+                reasoning_parts.append(rchunk)
+                await run.emit({"type": "reasoning", "text": rchunk})
         elif et == "tool_start":
             await run.emit({
                 "type": "tool_start",
@@ -2476,6 +2505,10 @@ async def _consume_into_run(
         elif et == "done":
             assistant_text = event.get("full_text") or "".join(full_text_parts)
             turn_meta = event.get("meta") if isinstance(event.get("meta"), dict) else None
+            _reasoning_text = _capped_reasoning(reasoning_parts)
+            if _reasoning_text is not None:
+                turn_meta = dict(turn_meta or {})
+                turn_meta["reasoning"] = _reasoning_text
             assistant_text, new_memory = _extract_memory_update(assistant_text)
             if new_memory is not None:
                 try:
@@ -3200,6 +3233,7 @@ async def _run_turn_worker(
         # cancel handler under no lock — assignment is atomic.
         run._gen = gen  # type: ignore[attr-defined]
 
+        reasoning_parts: list[str] = []
         async for event in gen:
             # Honour an explicit cancel BEFORE forwarding the event.  The
             # cancel handler also aclose()s the gen, so we usually exit
@@ -3213,6 +3247,13 @@ async def _run_turn_worker(
                 if chunk:
                     full_text_parts.append(chunk)
                 await run.emit({"type": "delta", "text": chunk})
+            elif et == "reasoning":
+                # Hidden reasoning: streamed for display, persisted on the
+                # message meta at ``done``. Never joins full_text_parts.
+                rchunk = event.get("text") or ""
+                if rchunk:
+                    reasoning_parts.append(rchunk)
+                    await run.emit({"type": "reasoning", "text": rchunk})
             elif et == "tool_start":
                 await run.emit({
                     "type": "tool_start",
@@ -3227,6 +3268,10 @@ async def _run_turn_worker(
             elif et == "done":
                 assistant_text = event.get("full_text") or "".join(full_text_parts)
                 turn_meta = event.get("meta") if isinstance(event.get("meta"), dict) else None
+                _reasoning_text = _capped_reasoning(reasoning_parts)
+                if _reasoning_text is not None:
+                    turn_meta = dict(turn_meta or {})
+                    turn_meta["reasoning"] = _reasoning_text
                 # If the model emitted a <memory_update> sentinel at the
                 # end of its response, persist the new memory and strip
                 # the block from what we save / show. Memory updates only

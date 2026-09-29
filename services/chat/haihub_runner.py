@@ -201,6 +201,10 @@ class _ThinkStripper:
         # returned verbatim by flush() if it never does (the model was
         # quoting the tag, not reasoning).
         self._hidden = ""
+        # Hidden text not yet handed out by drain_thought(): the caller
+        # streams it as ``reasoning`` events so a <think>-tag model's
+        # thinking is visible live, exactly like ``reasoning_content``.
+        self._thought_new = ""
 
     def feed(self, chunk: str) -> str:
         self._carry += chunk
@@ -224,12 +228,20 @@ class _ThinkStripper:
                     keep = len(_THINK_CLOSE) - 1
                     if len(self._carry) > keep:
                         self._hidden += self._carry[:-keep]
+                        self._thought_new += self._carry[:-keep]
                         self._carry = self._carry[-keep:]
                     break
+                self._hidden += self._carry[:idx]
+                self._thought_new += self._carry[:idx]
                 self._carry = self._carry[idx + len(_THINK_CLOSE):]
                 self._inside = False
                 self._hidden = ""
         return "".join(out)
+
+    def drain_thought(self) -> str:
+        """Return (and clear) <think> text captured since the last call."""
+        t, self._thought_new = self._thought_new, ""
+        return t
 
     def flush(self) -> str:
         tail = self._carry
@@ -371,6 +383,9 @@ async def _stream_step(
     """Stream one model call.
 
     Yields ``{"type":"delta","text":...}`` for visible content as it arrives,
+    ``{"type":"reasoning","text":...}`` for hidden-reasoning text (OpenAI-style
+    ``reasoning_content`` / ``reasoning`` delta fields, and ``<think>`` spans
+    a model inlines into ``content``) so the UI can show thinking live,
     then exactly one terminal sentinel: ``{"type":"_meta","tool_calls":[...],
     "content":str}`` on success or ``{"type":"_error","message":str}`` on a
     non-200 / transport failure. Sentinels are consumed by ``run_turn`` and not
@@ -442,9 +457,20 @@ async def _stream_step(
                     if choices[0].get("finish_reason"):
                         finish_reason = str(choices[0]["finish_reason"])
                     delta = choices[0].get("delta") or {}
+                    # Hidden reasoning. Display-only downstream: it never
+                    # joins ``content`` (so it can't leak into the reply or
+                    # the history) and never changes what is requested.
+                    rtext = delta.get("reasoning_content")
+                    if not isinstance(rtext, str) or not rtext:
+                        rtext = delta.get("reasoning")
+                    if isinstance(rtext, str) and rtext:
+                        yield {"type": "reasoning", "text": rtext}
                     ctext = delta.get("content")
                     if ctext:
                         clean = stripper.feed(ctext)
+                        thought = stripper.drain_thought()
+                        if thought:
+                            yield {"type": "reasoning", "text": thought}
                         if clean:
                             content_parts.append(clean)
                             yield {"type": "delta", "text": clean}
@@ -605,6 +631,8 @@ async def run_turn(
                                 if step_texts:
                                     yield {"type": "delta", "text": "\n\n"}
                             yield ev
+                        elif t == "reasoning":
+                            yield ev
                         elif t == "_error":
                             yield {"type": "error", "message": ev["message"]}
                             return
@@ -661,6 +689,10 @@ async def run_turn(
                             if step_texts:
                                 yield {"type": "delta", "text": "\n\n"}
                         yield ev
+                    elif t == "reasoning":
+                        # Hidden reasoning, streamed for display only. Not
+                        # part of step_texts / the persisted reply.
+                        yield ev
                     elif t == "_error":
                         yield {"type": "error", "message": ev["message"]}
                         return
@@ -716,6 +748,8 @@ async def run_turn(
                                     step_started = True
                                     if step_texts:
                                         yield {"type": "delta", "text": "\n\n"}
+                                yield ev
+                            elif t == "reasoning":
                                 yield ev
                             elif t == "_error":
                                 yield {"type": "error", "message": ev["message"]}

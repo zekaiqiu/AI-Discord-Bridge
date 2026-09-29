@@ -83,6 +83,13 @@ const MODEL_PREF_KEY = "chat.model.v2";
 // { glm: "max", kimi: "low" }. Stored per model so switching models keeps
 // each model's own level (mirrors the Discord bridge's effort map).
 const EFFORT_PREF_KEY = "chat.effort.v1";
+// Thinking-display setting (off / brief / full). Display-only, global (not
+// per model): how much of the streamed reasoning the bubbles render.
+import {
+  ThinkingMode,
+  loadThinkingMode,
+  saveThinkingMode,
+} from "./thinkingMode";
 const LAST_SESSION_KEY = "chat.lastSession";
 // Multi-window: persisted layout of open panes (session ids + stable
 // pane keys) and the focused pane, so a refresh restores the same set of
@@ -431,6 +438,10 @@ export function App(): JSX.Element {
   );
   const effortMapRef = useRef(effortMap);
   effortMapRef.current = effortMap;
+  // How much of the model's hidden reasoning the bubbles show. Visual only:
+  // the backend streams and persists reasoning regardless, and the effort
+  // pill (above) is the one that changes what is requested.
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(() => loadThinkingMode());
   // Workspace selector. Two roles:
   //  1. Default workspace for new sessions (legacy use).
   //  2. Filter for the sidebar list — the toggle controls *which bucket
@@ -1111,7 +1122,7 @@ export function App(): JSX.Element {
           const i = prev.length - 1;
           if (i < 0 || prev[i].role !== "assistant" || prev[i].status !== "streaming") return prev;
           const next = prev.slice();
-          next[i] = { ...next[i], content: "" };
+          next[i] = { ...next[i], content: "", reasoning: "" };
           return next;
         });
         try {
@@ -1268,6 +1279,16 @@ export function App(): JSX.Element {
         if (i < 0 || prev[i].role !== "assistant") return prev;
         const next = prev.slice();
         next[i] = { ...next[i], content: next[i].content + evt.text };
+        return next;
+      });
+    } else if (evt.type === "reasoning") {
+      // Live thinking: accumulate on the streaming bubble's client-only
+      // buffer. Rendering (and how much) is the thinking-display setting.
+      updateMessages(sid, (prev) => {
+        const i = prev.length - 1;
+        if (i < 0 || prev[i].role !== "assistant") return prev;
+        const next = prev.slice();
+        next[i] = { ...next[i], reasoning: (next[i].reasoning ?? "") + evt.text };
         return next;
       });
     } else if (evt.type === "tool_start" || evt.type === "tool_end") {
@@ -2324,6 +2345,11 @@ export function App(): JSX.Element {
                 model={ephem.model}
                 onModelChange={(m) => {
                   updatePaneEphem(pane.key, { model: m });
+                }}
+                thinkingMode={thinkingMode}
+                onThinkingModeChange={(mode) => {
+                  setThinkingMode(mode);
+                  saveThinkingMode(mode);
                 }}
                 effort={effortMap[ephem.model] ?? null}
                 onEffortChange={(lvl) => {

@@ -22,7 +22,7 @@
  * flips off as soon as the user moves more than ~80px above the bottom.
  */
 
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -31,6 +31,8 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import "katex/dist/katex.min.css";
 import { AttachmentMeta, Message, MessageMeta } from "../api";
+import { useT } from "../i18n";
+import { BRIEF_TAIL_CHARS, ThinkingModeContext } from "../thinkingMode";
 import { formatBytes } from "../utils";
 import { ArtifactPreview, ArtifactInfo } from "./Artifact";
 import { fileTypeIcon, fileTypeLabel } from "./Composer";
@@ -253,6 +255,7 @@ export function Thread({ sessionId, messages, streaming, onForkAndResend }: Thre
                 isLast &&
                 m.role === "assistant" &&
                 m.content === "" &&
+                !(m.reasoning && m.reasoning.length > 0) &&
                 !trailingWakePlaceholder;
               if (isEmptyStreamingPlaceholder) return null;
               return (
@@ -547,6 +550,66 @@ function AssistantBlankState({ status }: { status?: Message["status"] }): JSX.El
 }
 
 /**
+ * The model's hidden reasoning for one assistant message, rendered according
+ * to the thinking-display setting (ThinkingModeContext):
+ *   off   → nothing;
+ *   brief → one muted line showing the TAIL of the reasoning (the latest
+ *           thought while streaming), click to expand this message to full;
+ *   full  → a collapsible block, open by default, whole text.
+ * Source of the text: the live client-side buffer while streaming
+ * (``message.reasoning``), then the persisted ``meta.reasoning`` after a
+ * reload. Purely presentational — nothing here changes what was requested.
+ */
+function ThinkingBlock({ message }: { message: Message }): JSX.Element | null {
+  const mode = useContext(ThinkingModeContext);
+  const t = useT();
+  const [expanded, setExpanded] = useState(false);
+  const text = message.reasoning || message.meta?.reasoning || "";
+  if (mode === "off" || !text.trim()) return null;
+  const live = message.status === "streaming";
+  const label = live ? t("thread.thinking_live") : t("thread.thinking");
+  if (mode === "brief" && !expanded) {
+    const trimmed = text.trimEnd();
+    const tail = trimmed.length > BRIEF_TAIL_CHARS
+      ? "…" + trimmed.slice(-BRIEF_TAIL_CHARS)
+      : trimmed;
+    return (
+      <button
+        type="button"
+        className={`msg-thinking msg-thinking--brief ${live ? "is-live" : ""}`}
+        onClick={() => setExpanded(true)}
+        title={t("thread.thinking_expand")}
+        aria-label={`${label}: ${t("thread.thinking_expand")}`}
+      >
+        <span className="msg-thinking-label">💭 {label}</span>
+        <span className="msg-thinking-tail">{tail.replace(/\s+/g, " ")}</span>
+      </button>
+    );
+  }
+  // full mode, or a brief-mode block the user expanded.
+  return (
+    <details className={`msg-thinking msg-thinking--full ${live ? "is-live" : ""}`} open>
+      <summary className="msg-thinking-label">
+        💭 {label}
+        {mode === "brief" && (
+          <button
+            type="button"
+            className="msg-thinking-collapse"
+            onClick={(e) => {
+              e.preventDefault();
+              setExpanded(false);
+            }}
+          >
+            {t("thread.thinking_collapse")}
+          </button>
+        )}
+      </summary>
+      <div className="msg-thinking-body">{text}</div>
+    </details>
+  );
+}
+
+/**
  * Splits an assistant message at <<TOOL_OUTPUT>>...<</TOOL_OUTPUT>> markers
  * (if any) and renders each tool-output span inside the
  * "untrusted content" fence. Non-tool spans render as plain markdown.
@@ -565,9 +628,13 @@ function AssistantContent(
   // outside this component, so a message that is nothing but a file is not
   // blank even though its text is.
   const isBlank = !trimmed && artifacts.length === 0 && !hasAttachments;
+  // Reasoning arriving live means the turn is alive even with no visible
+  // text yet: don't call it blank while the model is still thinking.
+  const thinkingLive = !!message.reasoning && message.status === "streaming";
   return (
     <div className="bubble-text assistant-text">
-      {isBlank && <AssistantBlankState status={message.status} />}
+      <ThinkingBlock message={message} />
+      {isBlank && !thinkingLive && <AssistantBlankState status={message.status} />}
       {parts.map((part, i) =>
         part.kind === "tool_output" ? (
           <ToolOutputFence key={i} content={part.text} />

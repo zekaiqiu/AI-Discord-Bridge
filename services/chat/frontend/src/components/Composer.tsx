@@ -33,6 +33,7 @@ import {
   listFiles,
   listSchedules,
 } from "../api";
+import { ThinkingMode, THINKING_MODES, isThinkingMode } from "../thinkingMode";
 import { useT } from "../i18n";
 import { formatBytes } from "../utils";
 import { getDraft, setDraft } from "../draftStore";
@@ -89,6 +90,11 @@ export interface ComposerProps {
    *  provider default). Only rendered when the model has effort levels. */
   effort?: string | null;
   onEffortChange?: (level: string | null) => void;
+  /** Thinking-display setting (off / brief / full). VISUAL ONLY — it decides
+   *  how much of the streamed reasoning the bubbles render and never changes
+   *  what is requested from the model; the effort pill does that. */
+  thinkingMode?: ThinkingMode;
+  onThinkingModeChange?: (mode: ThinkingMode) => void;
   /** When true the next sent message is prefixed with a "use WebSearch"
    *  hint. Toggles off automatically after a successful send. */
   webSearchOn?: boolean;
@@ -286,6 +292,8 @@ export function Composer(props: ComposerProps): JSX.Element {
     model = "default",
   effort = null,
   onEffortChange,
+  thinkingMode = "brief",
+  onThinkingModeChange,
     onModelChange,
     webSearchOn = false,
     onToggleWebSearch,
@@ -796,6 +804,29 @@ export function Composer(props: ComposerProps): JSX.Element {
               </select>
             );
           })()}
+          {onThinkingModeChange && (
+            // Thinking-display selector, beside the effort pill. Rendered for
+            // every model (display-only, so nothing model-specific applies);
+            // "off" reads as the neutral state.
+            <select
+              className={`composer-pill composer-pill--select ${thinkingMode !== "off" ? "is-on" : ""}`}
+              value={thinkingMode}
+              disabled={disabled}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (isThinkingMode(v)) onThinkingModeChange(v);
+              }}
+              aria-label={t("composer.pill.thinking_aria")}
+              title={t("composer.pill.thinking_title")}
+              data-testid="thinking-mode-pill"
+            >
+              {THINKING_MODES.map((m) => (
+                <option key={m} value={m}>
+                  {t(`composer.pill.thinking_${m}`)}
+                </option>
+              ))}
+            </select>
+          )}
           {onToggleWebSearch && (
             <button
               type="button"

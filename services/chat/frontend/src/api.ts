@@ -134,6 +134,13 @@ export interface MessageMeta {
   } | null;
   tok_s?: number | null;
   tokens_estimated?: boolean;
+  /**
+   * The model's hidden reasoning for this turn, when the provider streamed
+   * any (GLM/Kimi ``reasoning_content``, MiniMax ``<think>`` spans, claude
+   * ``thinking`` blocks). Persisted so the thinking block survives a reload.
+   * How much of it is SHOWN is the client's thinking-display setting.
+   */
+  reasoning?: string | null;
 }
 
 export interface Message {
@@ -177,6 +184,12 @@ export interface Message {
    * the server has confirmed the write.
    */
   pending?: boolean;
+  /**
+   * CLIENT-ONLY. Reasoning text accumulated from live ``reasoning`` stream
+   * events for the message currently streaming. On ``done`` the persisted
+   * copy arrives as ``meta.reasoning``; this field is only the live buffer.
+   */
+  reasoning?: string;
 }
 
 export interface Session extends SessionSummary {
@@ -187,6 +200,8 @@ export interface Session extends SessionSummary {
 
 export type StreamEvent =
   | { type: "delta"; text: string }
+  /** Hidden-reasoning delta. Display-only; never part of the reply text. */
+  | { type: "reasoning"; text: string }
   | { type: "tool_start"; name: string; input_summary: string }
   | { type: "tool_end"; name: string }
   | { type: "done"; full_text: string; meta?: MessageMeta | null }

@@ -3610,3 +3610,81 @@ textarea:focus-visible {
   opacity: 0.95;
   white-space: nowrap;
 }
+
+/* Thinking block: the model's hidden reasoning, rendered per the
+   thinking-display pill (off / brief / full). Brief is one muted line showing
+   the tail of the reasoning (a button: click to expand that message); full is
+   a <details> open by default with the whole text. Display-only. */
+.msg-thinking {
+  display: block;
+  width: 100%;
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  border-left: 3px solid var(--border);
+  padding-left: 10px;
+  box-sizing: border-box;
+}
+.msg-thinking-label {
+  font-weight: 600;
+  margin-right: 8px;
+  white-space: nowrap;
+}
+.msg-thinking--brief {
+  background: none;
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.msg-thinking--brief:hover {
+  color: var(--text);
+}
+.msg-thinking-tail {
+  font-style: italic;
+  opacity: 0.85;
+}
+.msg-thinking--full > summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.msg-thinking--full > summary::-webkit-details-marker {
+  display: none;
+}
+.msg-thinking-collapse {
+  margin-left: 10px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.msg-thinking-body {
+  margin-top: 6px;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+  font-style: italic;
+  opacity: 0.9;
+}
+.msg-thinking.is-live .msg-thinking-label::after {
+  content: " ·";
+  animation: msg-thinking-blink 1s steps(2, start) infinite;
+}
+@keyframes msg-thinking-blink {
+  to { visibility: hidden; }
+}

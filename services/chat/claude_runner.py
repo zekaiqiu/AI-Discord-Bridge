@@ -795,6 +795,39 @@ def _extract_delta_text(obj: dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_reasoning_text(obj: dict[str, Any]) -> str | None:
+    """Pull a hidden-reasoning (extended thinking) delta out of a stream-json
+    line, if it carries one. Mirrors ``_extract_delta_text`` for the thinking
+    shapes:
+      * ``{"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "..."}}``
+      * ``{"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "..."}, ...]}}``
+    Display-only downstream (SSE ``reasoning`` events + ``meta.reasoning``);
+    never joins the reply text. ``signature_delta`` frames carry no text and
+    are ignored."""
+    if not isinstance(obj, dict):
+        return None
+    t = obj.get("type")
+    if t == "content_block_delta":
+        d = obj.get("delta") or {}
+        if isinstance(d, dict) and d.get("type") == "thinking_delta":
+            text = d.get("thinking")
+            if isinstance(text, str) and text:
+                return text
+        return None
+    if t == "assistant":
+        msg = obj.get("message") or {}
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            parts = [
+                p.get("thinking") for p in content
+                if isinstance(p, dict) and p.get("type") == "thinking"
+                and isinstance(p.get("thinking"), str) and p.get("thinking")
+            ]
+            if parts:
+                return "".join(parts)
+    return None
+
+
 def _extract_tool_start(obj: dict[str, Any]) -> dict[str, Any] | None:
     """Detect a tool_use start frame and return ``{name, input_summary}``."""
     if not isinstance(obj, dict):
@@ -1359,6 +1392,10 @@ async def normalize_session_turn(
     turn_start = time.monotonic()
     saw_result = False
     async for obj in turn:
+        reasoning = _extract_reasoning_text(obj)
+        if reasoning:
+            yield {"type": "reasoning", "text": reasoning}
+            continue
         delta = _extract_delta_text(obj)
         if delta:
             full_text_parts.append(delta)
@@ -1932,6 +1969,12 @@ async def run_turn(
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     yield {"type": "error", "message": f"malformed stream-json: {exc}"}
                     return
+
+                reasoning = _extract_reasoning_text(obj)
+                if reasoning:
+                    emitted = True
+                    yield {"type": "reasoning", "text": reasoning}
+                    continue
 
                 delta = _extract_delta_text(obj)
                 if delta:
