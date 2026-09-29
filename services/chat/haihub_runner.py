@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import re
 import logging
 import os
 import time
@@ -104,6 +105,103 @@ _NO_REPLY_NOTICE = (
     "effort level or a narrower question.]"
 )
 _TRUNCATED_NOTICE = "[reply truncated: the model hit its output limit]"
+
+# REPETITION GUARD. Two live turns (2026-09-28, 2026-09-29) degenerated the
+# same way: deep into a long tool-loop turn at high/max effort the model
+# stopped calling tools and narrated its own intent ("EMIT. GO. FINAL. GO.")
+# in the visible reply until the 64k output ceiling -- 223 KB and 96 KB of
+# garbage and no answer. The signal that separates that from real prose,
+# code, tables and link footers (measured over every long reply in the
+# store, 32k windows) is the share of short sentence units in the recent
+# text that are EXACT repeats: the loops cross 0.5 tens of thousands of
+# characters before the pure "GO." tail; no normal window with >= 40 units
+# came near it (max 0.44 at 25 units). Two consecutive checks must agree.
+_REP_WINDOW = 3000        # chars of recent text examined
+_REP_CHECK_EVERY = 250    # re-examine after this many new chars
+_REP_MIN_UNITS = 40       # fewer sentence units than this: no verdict
+_REP_MAX_UNIT_LEN = 60    # longer units are prose, never loop fodder
+_REP_THRESHOLD = 0.5      # duplicate fraction at/above which a check strikes
+_REP_STRIKES = 2          # consecutive strikes before the step is cut
+_REPETITION_NOTICE = "[the model's output degenerated into repetition and was cut off]"
+_REPETITION_RETRY_NUDGE = (
+    "Your previous attempt degenerated into repetitive text and was cut off. "
+    "Answer the user now, directly and concisely, from the work already "
+    "completed, without further tool calls, and say what is still unfinished."
+)
+_REPETITION_GIVEUP_NOTICE = (
+    "[The model's output degenerated into repetition twice. Try again with a "
+    "lower effort level or a narrower question.]"
+)
+# An unclosed fence (code still streaming) runs to the end of the window.
+_REP_FENCE = re.compile(r"```.*?(```|$)", re.S)
+_REP_SPLIT = re.compile(r"(?<=[.!?。！？])\s+|\n+")
+_REP_NORM = re.compile(r"[^a-z0-9\u4e00-\u9fff]+")
+# Only SENTENCES count: a unit must end in terminal punctuation. Code lines
+# (``pass``, ``else:``, ``return x``) repeat by nature and carry none, so a
+# window that starts inside a code block whose opening fence has scrolled
+# away still yields no verdict. The loops are all sentences ("GO." "EMIT."
+# "DONE."). Measured with no fence stripping at all over every reply in the
+# store: the highest normal window stayed well below the threshold.
+_REP_TERMINAL = re.compile(r"[.!?。！？][\"'”’)\]]*$")
+
+
+def _duplicate_unit_fraction(window: str) -> tuple[float, int]:
+    """(fraction of short sentence units that are exact repeats, unit count)
+    over ``window``. Fenced code is dropped and only punctuation-terminated
+    units are counted -- see the notes above."""
+    text = _REP_FENCE.sub(" ", window)
+    units: list[str] = []
+    for raw in _REP_SPLIT.split(text):
+        raw = raw.strip()
+        if not _REP_TERMINAL.search(raw):
+            continue
+        u = _REP_NORM.sub("", raw.lower())
+        if 2 <= len(u) <= _REP_MAX_UNIT_LEN:
+            units.append(u)
+    if len(units) < _REP_MIN_UNITS:
+        return 0.0, len(units)
+    return 1.0 - len(set(units)) / len(units), len(units)
+
+
+class _RepetitionGuard:
+    """Incremental degenerate-output detector over one streamed text.
+
+    ``feed(chunk)`` returns True the moment repetition is confirmed
+    (``_REP_STRIKES`` consecutive checks at/above ``_REP_THRESHOLD``).
+    ``cut_at`` is then the length of text to KEEP: everything from the first
+    striking window onward is the loop.
+    """
+
+    def __init__(self) -> None:
+        self._tail = ""
+        self._total = 0
+        self._since_check = 0
+        self._strikes = 0
+        self._first_strike_at: int | None = None
+        self.cut_at: int | None = None
+        self.tripped = False
+
+    def feed(self, chunk: str) -> bool:
+        if self.tripped or not chunk:
+            return self.tripped
+        self._total += len(chunk)
+        self._since_check += len(chunk)
+        self._tail = (self._tail + chunk)[-_REP_WINDOW:]
+        if self._since_check < _REP_CHECK_EVERY or len(self._tail) < _REP_WINDOW:
+            return False
+        self._since_check = 0
+        frac, _n = _duplicate_unit_fraction(self._tail)
+        if frac >= _REP_THRESHOLD:
+            self._strikes += 1
+            if self._first_strike_at is None:
+                self._first_strike_at = max(0, self._total - _REP_WINDOW)
+            if self._strikes >= _REP_STRIKES:
+                self.tripped = True
+                self.cut_at = self._first_strike_at
+        else:
+            self._strikes = 0
+            self._first_strike_at = None
+        return self.tripped
 _MAX_TOOL_OUTPUT = 16000     # chars of tool output fed back to the model
 
 # Generous read timeout: thinking models lag before first token.
@@ -393,6 +491,11 @@ async def _stream_step(
     """
     stripper = _ThinkStripper()
     content_parts: list[str] = []
+    # Degenerate-output guards, one per stream (a loop in hidden reasoning
+    # burns the same budget as one in the reply).
+    cguard = _RepetitionGuard()
+    rguard = _RepetitionGuard()
+    degenerate: str | None = None
     tool_acc: dict[int, dict[str, Any]] = {}
     id_slots: dict[str, int] = {}
     finish_reason: str | None = None
@@ -465,15 +568,27 @@ async def _stream_step(
                         rtext = delta.get("reasoning")
                     if isinstance(rtext, str) and rtext:
                         yield {"type": "reasoning", "text": rtext}
+                        if rguard.feed(rtext):
+                            degenerate = "reasoning"
+                            stream_done = True
+                            break
                     ctext = delta.get("content")
                     if ctext:
                         clean = stripper.feed(ctext)
                         thought = stripper.drain_thought()
                         if thought:
                             yield {"type": "reasoning", "text": thought}
+                            if rguard.feed(thought):
+                                degenerate = "reasoning"
+                                stream_done = True
+                                break
                         if clean:
                             content_parts.append(clean)
                             yield {"type": "delta", "text": clean}
+                            if cguard.feed(clean):
+                                degenerate = "content"
+                                stream_done = True
+                                break
                     for pos, tc in enumerate(delta.get("tool_calls") or []):
                         idx = tc.get("index")
                         if idx is None:
@@ -496,6 +611,35 @@ async def _stream_step(
         yield {"type": "_error", "message": f"haihub request failed: {type(exc).__name__}"}
         return
 
+    if degenerate:
+        # Leaving the `async with client.stream(...)` block above closed the
+        # response, so the gateway stops generating. Report the step as
+        # finish_reason="repetition": run_turn retries it once (low effort,
+        # wrap-up nudge, no tools). Content is trimmed to what preceded the
+        # loop; tool calls parsed alongside a degenerate stream are not
+        # trusted.
+        # The stripper may hold back a few chars pending a possible tag;
+        # they are real text and belong to the step (before any trim).
+        tail = stripper.flush()
+        if tail:
+            content_parts.append(tail)
+            yield {"type": "delta", "text": tail}
+        content = "".join(content_parts)
+        if degenerate == "content" and cguard.cut_at is not None:
+            content = content[:cguard.cut_at]
+        logger.warning(
+            "haihub: %s stream degenerated into repetition (%s) after %d chars; step cut",
+            payload.get("model"), degenerate, len("".join(content_parts)),
+        )
+        yield {
+            "type": "_meta",
+            "tool_calls": [],
+            "content": content,
+            "usage": usage,
+            "finish_reason": "repetition",
+            "degenerate": degenerate,
+        }
+        return
     tail = stripper.flush()
     if tail:
         content_parts.append(tail)
@@ -599,6 +743,11 @@ async def run_turn(
     step_texts: list[str] = []
     final_text = ""
     length_retried = False
+    repetition_retried = False
+    # Set by the repetition branch below: the NEXT step is a wrap-up call
+    # (low effort, this nudge appended, tools removed). The payload is
+    # rebuilt every step, so the override lives here rather than in it.
+    wrap_up_nudge: str | None = None
     turn_start = time.monotonic()
     # Accumulate usage across tool round-trips so the reported total covers
     # the whole turn (each step bills its own tokens). None entries when the
@@ -667,13 +816,19 @@ async def run_turn(
                     # a length-based estimate below.
                     "stream_options": {"include_usage": True},
                 }
-                if use_tools:
+                if use_tools and wrap_up_nudge is None:
                     payload["tools"] = _TOOLS
                     payload["tool_choice"] = "auto"
                 # OpenAI-style reasoning-effort control. Callers pre-validate
                 # the level against the model's supported set (app.py), so
                 # an unset/empty value simply means "provider default".
-                if effort:
+                if wrap_up_nudge is not None:
+                    payload["reasoning_effort"] = _RETRY_EFFORT
+                    payload["messages"] = messages + [
+                        {"role": "system", "content": wrap_up_nudge},
+                    ]
+                    wrap_up_nudge = None
+                elif effort:
                     payload["reasoning_effort"] = effort
 
                 meta: dict[str, Any] | None = None
@@ -719,6 +874,35 @@ async def run_turn(
                 if finish is None and not tool_calls and not step_content.strip():
                     yield {"type": "error", "message": f"{display}: stream ended without a reply or finish reason"}
                     return
+
+                if finish == "repetition":
+                    # DEGENERATE OUTPUT (see _RepetitionGuard). The step's
+                    # content was trimmed to what preceded the loop; the live
+                    # stream already showed the loop, and ``done``'s
+                    # full_text replaces it on the client. Retry ONCE as a
+                    # wrap-up (low effort, nudge, no tools) so the user gets
+                    # an answer from the work completed; a second
+                    # degeneration gives up with a visible notice.
+                    logger.warning(
+                        "haihub: %s step degenerated (%s); %s",
+                        display, meta.get("degenerate"),
+                        "giving up" if repetition_retried else "retrying as a wrap-up",
+                    )
+                    tool_calls = []
+                    if step_texts or step_content.strip():
+                        yield {"type": "delta", "text": "\n\n"}
+                    yield {"type": "delta", "text": _REPETITION_NOTICE}
+                    step_texts.append(
+                        (step_content.rstrip() + "\n\n" + _REPETITION_NOTICE)
+                        if step_content.strip() else _REPETITION_NOTICE
+                    )
+                    if repetition_retried:
+                        yield {"type": "delta", "text": "\n\n" + _REPETITION_GIVEUP_NOTICE}
+                        step_texts.append(_REPETITION_GIVEUP_NOTICE)
+                        break
+                    repetition_retried = True
+                    wrap_up_nudge = _REPETITION_RETRY_NUDGE
+                    continue
 
                 if finish == "length" and not tool_calls and not step_content.strip():
                     # The whole output budget went to hidden reasoning: the
