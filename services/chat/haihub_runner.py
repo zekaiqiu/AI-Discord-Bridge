@@ -78,12 +78,33 @@ _MAX_TOKENS = 8192
 # No hard cap on model<->tool round-trips: the loop runs until the model
 # returns a tool-free answer. Each step is still bounded by _REQUEST_TIMEOUT
 # (model call) and _TOOL_TIMEOUT (run_bash), so a turn can't hang indefinitely.
-_TOOL_TIMEOUT = 90           # seconds per run_bash command (enforced in-container)
-# Tool round-trips per turn. This is a runaway guard, not a work budget: a
-# real research task (scrape a site, fetch fifty pages) legitimately needs
-# well over 40. When it is reached the model gets one final no-tools call to
-# answer with what it has, rather than the turn just stopping.
-_MAX_STEPS = 150
+# Seconds ONE run_bash command may run before it is killed (enforced
+# in-container). A per-command budget, not a turn budget: long data pulls and
+# builds are normal, so it is an hour. The turn itself has no time limit.
+_TOOL_TIMEOUT = int(os.environ.get("CHAT_TOOL_TIMEOUT_SEC", "3600"))
+# Tool round-trips per turn. 0 = UNLIMITED (the default, 2026-09-29): a long
+# agent session runs until the model answers or the user presses Stop. The
+# failure modes a cap used to paper over are handled directly instead: a
+# degenerate loop by _RepetitionGuard, context growth by
+# _compact_tool_history. Set CHAT_MAX_TOOL_STEPS to reinstate a cap; when it
+# is reached the model gets one final no-tools call to answer from its work.
+_MAX_STEPS = int(os.environ.get("CHAT_MAX_TOOL_STEPS", "0"))
+
+# CONTEXT BUDGET for one turn's message list. With no step cap, tool output
+# accumulates without bound (16k chars per call) and would eventually overflow
+# the model's context, ending the turn on a provider 400. Before every step,
+# if the messages exceed the budget, the OLDEST tool results are replaced by a
+# short elision note (the model's own narration and tool-call arguments stay,
+# so it knows what it ran). The most recent results are never elided. If the
+# provider still rejects the request for length, the budget is halved and the
+# step retried.
+_CONTEXT_CHAR_BUDGET = int(os.environ.get("CHAT_CONTEXT_CHAR_BUDGET", "400000"))
+_CONTEXT_KEEP_RECENT_TOOLS = 8
+_CONTEXT_MIN_BUDGET = 40000
+_CONTEXT_OVERFLOW_HINTS = (
+    "context", "too long", "maximum", "max_tokens", "token limit",
+    "tokens exceed", "input length", "prompt is too long", "exceeds",
+)
 _CAP_NUDGE = (
     "You have used the maximum number of tool calls allowed in one turn. "
     "Do not call any more tools. Give the user your final answer now from "
@@ -143,6 +164,61 @@ _REP_NORM = re.compile(r"[^a-z0-9\u4e00-\u9fff]+")
 # "DONE."). Measured with no fence stripping at all over every reply in the
 # store: the highest normal window stayed well below the threshold.
 _REP_TERMINAL = re.compile(r"[.!?。！？][\"'”’)\]]*$")
+
+
+def _message_chars(m: dict[str, Any]) -> int:
+    n = len(m.get("content") or "") if isinstance(m.get("content"), str) else 0
+    for tc in m.get("tool_calls") or []:
+        n += len(((tc.get("function") or {}).get("arguments")) or "")
+    rc = m.get("reasoning_content")
+    if isinstance(rc, str):
+        n += len(rc)
+    return n
+
+
+def _compact_tool_history(
+    messages: list[dict[str, Any]], budget: int,
+    keep_recent: int = _CONTEXT_KEEP_RECENT_TOOLS,
+) -> int:
+    """Elide the oldest tool results IN PLACE until ``messages`` fits
+    ``budget`` chars. Never touches system/user messages, the model's own
+    text, or the ``keep_recent`` newest tool results. Returns how many results
+    were elided (0 if already within budget)."""
+    total = sum(_message_chars(m) for m in messages)
+    if total <= budget:
+        return 0
+    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    candidates = tool_idx[:-keep_recent] if keep_recent else tool_idx
+    elided = 0
+    for i in candidates:
+        if total <= budget:
+            break
+        body = messages[i].get("content") or ""
+        if body.startswith("[earlier tool output elided"):
+            continue
+        note = (f"[earlier tool output elided to keep this long session within "
+                f"the context window: {len(body)} chars. Re-run the command if "
+                f"you need it again.]")
+        total -= len(body) - len(note)
+        messages[i]["content"] = note
+        elided += 1
+    # Older echoed reasoning is the next largest thing and the least useful.
+    if total > budget:
+        asst = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+        for i in asst[:-2]:
+            if total <= budget:
+                break
+            rc = messages[i].pop("reasoning_content", None)
+            if isinstance(rc, str):
+                total -= len(rc)
+    return elided
+
+
+def _is_context_overflow(message: str) -> bool:
+    m = (message or "").lower()
+    return ("http 400" in m or "http 413" in m or "provider error" in m) and any(
+        h in m for h in _CONTEXT_OVERFLOW_HINTS
+    )
 
 
 def _duplicate_unit_fraction(window: str) -> tuple[float, int]:
@@ -748,6 +824,7 @@ async def run_turn(
     # (low effort, this nudge appended, tools removed). The payload is
     # rebuilt every step, so the override lives here rather than in it.
     wrap_up_nudge: str | None = None
+    context_budget = _CONTEXT_CHAR_BUDGET
     turn_start = time.monotonic()
     # Accumulate usage across tool round-trips so the reported total covers
     # the whole turn (each step bills its own tokens). None entries when the
@@ -758,7 +835,7 @@ async def run_turn(
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
             for _step in itertools.count():
-                if _step >= _MAX_STEPS:
+                if _MAX_STEPS and _step >= _MAX_STEPS:
                     # Budget exhausted: one last call with tools removed so
                     # the user gets an answer from the completed work.
                     cap_payload: dict[str, Any] = {
@@ -831,8 +908,18 @@ async def run_turn(
                 elif effort:
                     payload["reasoning_effort"] = effort
 
+                # Keep the growing tool history inside the context window
+                # (no step cap any more -- see _CONTEXT_CHAR_BUDGET).
+                n_el = _compact_tool_history(messages, context_budget)
+                if n_el:
+                    # In place: payload["messages"] holds the same dicts
+                    # (a wrap-up payload is messages + [nudge]).
+                    logger.info("haihub: %s step %d: elided %d old tool result(s) to fit %d chars",
+                                display, _step, n_el, context_budget)
+
                 meta: dict[str, Any] | None = None
                 step_started = False
+                overflow_retry = False
                 async for ev in _stream_step(client, payload, base_url=base, api_key=key):
                     t = ev["type"]
                     if t == "delta":
@@ -849,10 +936,29 @@ async def run_turn(
                         # part of step_texts / the persisted reply.
                         yield ev
                     elif t == "_error":
+                        if (not step_started and _is_context_overflow(ev["message"])
+                                and context_budget > _CONTEXT_MIN_BUDGET):
+                            # The provider rejected the request for length:
+                            # shrink the budget and redo this step rather
+                            # than ending a long session.
+                            # Size from what was actually rejected, not the
+                            # budget: the request may already sit well under it.
+                            _sent = sum(_message_chars(m) for m in messages)
+                            context_budget = max(_CONTEXT_MIN_BUDGET,
+                                                 min(context_budget // 2, int(_sent * 0.6)))
+                            logger.warning(
+                                "haihub: %s context overflow (%s); compacting to %d chars and retrying",
+                                display, ev["message"][:160], context_budget,
+                            )
+                            _compact_tool_history(messages, context_budget, keep_recent=2)
+                            overflow_retry = True
+                            break
                         yield {"type": "error", "message": ev["message"]}
                         return
                     elif t == "_meta":
                         meta = ev
+                if overflow_retry:
+                    continue
                 if meta is None:
                     yield {"type": "error", "message": "haihub: empty response stream"}
                     return

@@ -1095,7 +1095,10 @@ export function App(): JSX.Element {
     // A backend restart re-runs the interrupted turn on the same bubble; that
     // re-run can take minutes, so keep following it rather than giving up
     // after two minutes and leaving a stale spinner.
-    const POLL_DEADLINE_MS = 900_000;
+    // No practical deadline: an agent turn can legitimately run for hours,
+    // and a restart re-runs it on the same bubble. Keep following until the
+    // turn ends, the session is deleted, or the pane's controller aborts.
+    const POLL_DEADLINE_MS = 7 * 24 * 3600_000;
     const deadline = Date.now() + POLL_DEADLINE_MS;
     while (Date.now() < deadline) {
       try {

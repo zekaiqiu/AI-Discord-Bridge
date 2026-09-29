@@ -67,11 +67,17 @@ DM_CHUNK_SIZE = 1850        # safe per-message size after the code-fence overhea
 TASKS_LIST_SUMMARY_LEN = 150
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB cap per attachment
 TRANSCRIPT_LIMIT = 50
-# Wall-clock timeout for a single sync `claude -p` turn. Without this, a
-# child Bash tool call that hangs (e.g. an `until ...; do sleep; done` whose
-# condition never matches) would hold claude_lock indefinitely and freeze
-# every Discord message after it. 10 min is plenty for any reasonable turn.
-CLAUDE_RUN_TIMEOUT_SEC = int(os.environ.get("CLAUDE_RUN_TIMEOUT_SEC", "600"))
+# Wall-clock limit for one chat turn (claude CLI or the GLM/Kimi tool loop).
+# 0 = NONE (default since 2026-09-29): long agent sessions must not be cut
+# off. What the old 10-minute / 1-hour cap protected against -- a hung child
+# holding claude_lock and freezing every later message -- is covered by the
+# SILENCE watchdog below (no output at all for that long) and by !stop.
+CLAUDE_RUN_TIMEOUT_SEC = int(os.environ.get("CLAUDE_RUN_TIMEOUT_SEC", "0"))
+# Kill a claude CLI turn only if it produces NO stream-json output for this
+# long. The CLI streams partial frames continuously while it works, and its
+# own Bash tool is bounded (10 min max), so this only ever fires on a truly
+# wedged process.
+CLAUDE_SILENCE_TIMEOUT_SEC = int(os.environ.get("CLAUDE_SILENCE_TIMEOUT_SEC", "7200"))
 # Bound each individual Discord API call (DM send, fetch_user, edit). Without
 # this a slow/disconnected gateway can pin ping_loop indefinitely on an
 # unbounded await, which is the historical "bot got stuck" failure mode.
@@ -569,7 +575,66 @@ _OPENAI_PROVIDERS: dict[str, dict] = {
     },
 }
 _QWEN_MAX_TOKENS = 8192
-_QWEN_TOOL_TIMEOUT = 120          # seconds per run_bash command
+# Seconds ONE run_bash command may run (per command, not per turn).
+_QWEN_TOOL_TIMEOUT = int(os.environ.get("BRIDGE_TOOL_TIMEOUT_SEC", "3600"))
+# Context budget for one turn's tool loop (chars). No step cap exists, so tool
+# output would otherwise grow until the provider rejects the request; the
+# oldest tool results are elided first, the newest never. Mirrors
+# services/chat haihub_runner._compact_tool_history.
+_QWEN_CONTEXT_CHAR_BUDGET = int(os.environ.get("BRIDGE_CONTEXT_CHAR_BUDGET", "400000"))
+_QWEN_CONTEXT_KEEP_RECENT = 8
+_QWEN_CONTEXT_MIN_BUDGET = 40000
+_QWEN_OVERFLOW_HINTS = (
+    "context", "too long", "maximum", "max_tokens", "token limit",
+    "tokens exceed", "input length", "prompt is too long", "exceeds",
+)
+
+
+def _qwen_msg_chars(m: dict) -> int:
+    n = len(m.get("content") or "") if isinstance(m.get("content"), str) else 0
+    for tc in m.get("tool_calls") or []:
+        n += len(((tc.get("function") or {}).get("arguments")) or "")
+    rc = m.get("reasoning_content")
+    if isinstance(rc, str):
+        n += len(rc)
+    return n
+
+
+def _qwen_compact_history(messages: list, budget: int,
+                          keep_recent: int = _QWEN_CONTEXT_KEEP_RECENT) -> int:
+    """Elide the oldest tool results in place until ``messages`` fits
+    ``budget`` chars. Returns how many were elided."""
+    total = sum(_qwen_msg_chars(m) for m in messages)
+    if total <= budget:
+        return 0
+    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    elided = 0
+    for i in (tool_idx[:-keep_recent] if keep_recent else tool_idx):
+        if total <= budget:
+            break
+        body = messages[i].get("content") or ""
+        if body.startswith("[earlier tool output elided"):
+            continue
+        note = (f"[earlier tool output elided to keep this long session within "
+                f"the context window: {len(body)} chars. Re-run the command if "
+                f"you need it again.]")
+        total -= len(body) - len(note)
+        messages[i]["content"] = note
+        elided += 1
+    if total > budget:
+        asst = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+        for i in asst[:-2]:
+            if total <= budget:
+                break
+            rc = messages[i].pop("reasoning_content", None)
+            if isinstance(rc, str):
+                total -= len(rc)
+    return elided
+
+
+def _qwen_is_overflow(error: str) -> bool:
+    e = (error or "").lower()
+    return ("http 400" in e or "http 413" in e) and any(h in e for h in _QWEN_OVERFLOW_HINTS)
 _QWEN_MAX_TOOL_OUTPUT = 16000     # chars of tool output fed back to the model
 _QWEN_REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
 
@@ -795,14 +860,15 @@ async def _run_haihub(
         {"role": "user", "content": full_prompt},
     ]
     text_parts: list[str] = []
-    deadline = time.monotonic() + CLAUDE_RUN_TIMEOUT_SEC
+    deadline = (time.monotonic() + CLAUDE_RUN_TIMEOUT_SEC) if CLAUDE_RUN_TIMEOUT_SEC > 0 else None
+    context_budget = _QWEN_CONTEXT_CHAR_BUDGET
     log.info("running %s model=%s (label=%s, emergency=%s, effort=%s, sink=%s)",
              provider, haihub_model, label, emergency, effort, sink is not None)
 
     try:
         async with httpx.AsyncClient(timeout=_QWEN_REQUEST_TIMEOUT) as client:
             while True:
-                if time.monotonic() > deadline:
+                if deadline is not None and time.monotonic() > deadline:
                     text_parts.append(
                         f"\n[{label} turn exceeded the "
                         f"{CLAUDE_RUN_TIMEOUT_SEC}s budget and was stopped]"
@@ -818,12 +884,29 @@ async def _run_haihub(
                 }
                 if effort:
                     payload["reasoning_effort"] = effort
+                # Keep the growing tool history inside the context window
+                # (in place; payload["messages"] is this same list).
+                _n_el = _qwen_compact_history(messages, context_budget)
+                if _n_el:
+                    log.info("%s: elided %d old tool result(s) to fit %d chars",
+                             provider, _n_el, context_budget)
                 reasoning_parts: list[str] = []
                 tool_calls, content, error = await _qwen_stream_step(
                     client, key, payload, sink, text_parts,
                     base_url=base_url, provider=provider,
                     reasoning_parts=reasoning_parts,
                 )
+                if (error is not None and not content and _qwen_is_overflow(error)
+                        and context_budget > _QWEN_CONTEXT_MIN_BUDGET):
+                    # Rejected for length: shrink from what was sent and redo
+                    # the step instead of ending a long session.
+                    _sent = sum(_qwen_msg_chars(m) for m in messages)
+                    context_budget = max(_QWEN_CONTEXT_MIN_BUDGET,
+                                         min(context_budget // 2, int(_sent * 0.6)))
+                    log.warning("%s context overflow (%s); compacting to %d chars and retrying",
+                                provider, error[:160], context_budget)
+                    _qwen_compact_history(messages, context_budget, keep_recent=2)
+                    continue
                 if error is not None:
                     text_parts.append(f"\n[{label} error: {error}]")
                     break
@@ -1126,7 +1209,16 @@ async def run_claude(
 
         async def consume_stdout() -> None:
             nonlocal final_result
-            async for raw in proc.stdout:
+            while True:
+                # Silence watchdog: a turn may run as long as it keeps
+                # producing output; only a wedged process is killed.
+                if CLAUDE_SILENCE_TIMEOUT_SEC > 0:
+                    raw = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=CLAUDE_SILENCE_TIMEOUT_SEC)
+                else:
+                    raw = await proc.stdout.readline()
+                if not raw:
+                    break
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
@@ -1168,14 +1260,15 @@ async def run_claude(
             try:
                 await asyncio.wait_for(
                     asyncio.gather(consume_stdout(), consume_stderr()),
-                    timeout=CLAUDE_RUN_TIMEOUT_SEC,
+                    timeout=CLAUDE_RUN_TIMEOUT_SEC if CLAUDE_RUN_TIMEOUT_SEC > 0 else None,
                 )
                 await proc.wait()
             except asyncio.TimeoutError:
                 log.warning(
-                    "claude run exceeded %ds wall-clock — killing pgid=%d "
-                    "(account=%s)",
-                    CLAUDE_RUN_TIMEOUT_SEC, proc.pid, route.name,
+                    "claude run hit its limit (wall-clock %ss, silence %ss) — "
+                    "killing pgid=%d (account=%s)",
+                    CLAUDE_RUN_TIMEOUT_SEC or "none", CLAUDE_SILENCE_TIMEOUT_SEC,
+                    proc.pid, route.name,
                 )
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -1188,8 +1281,10 @@ async def run_claude(
                         "claude pid=%d still alive 5s after SIGKILL", proc.pid
                     )
                 raise RuntimeError(
-                    f"claude turn exceeded the {CLAUDE_RUN_TIMEOUT_SEC}s "
-                    "timeout and was killed (likely a hung Bash tool call). "
+                    f"claude produced no output for {CLAUDE_SILENCE_TIMEOUT_SEC}s"
+                    + (f" or exceeded the {CLAUDE_RUN_TIMEOUT_SEC}s wall clock"
+                       if CLAUDE_RUN_TIMEOUT_SEC > 0 else "")
+                    + " and was killed (likely a wedged tool call). "
                     "The bridge is unblocked — try again."
                 )
         finally:
