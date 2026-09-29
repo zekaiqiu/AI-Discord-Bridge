@@ -34,8 +34,8 @@ _TOKENHUB_KEY_FILE = Path(os.environ.get(
 # Frontend alias -> TokenHub model id (exact, case-sensitive).
 _TOKENHUB_MODELS: dict[str, str] = {
     "glm": "glm-5.3",
-    "kimi": "kimi-k3",
 }
+# "kimi" moved to kimi_runner (Kimi Code plan key) on 2026-09-29.
 
 # TokenHub accepts (and serves) larger completions than the haihub default;
 # long report-style chat turns with high effort need the headroom.

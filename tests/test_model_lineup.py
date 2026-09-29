@@ -95,3 +95,34 @@ def test_mimo_endpoint_falls_back_to_tokenhub(monkeypatch, tmp_path):
     monkeypatch.delenv("MIMO_API_KEY")
     monkeypatch.setattr(bot, "_TOKENHUB_KEY_FILE", tmp_path / "absent2")
     assert bot._resolve_mimo_endpoint() == (None, None)
+
+
+def test_kimi_runs_on_kimi_code_plan():
+    """Kimi K3 moved from TokenHub to the Kimi Code plan key on 2026-09-29;
+    the id stays "kimi-k3" so persisted picks survive."""
+    import os
+    m = bot._model_by_id("kimi-k3")
+    assert m["provider"] == "kimi"
+    assert m["api_model"] == os.environ.get("KIMI_MODEL", "k3")
+    assert m["effort"] == ["low", "high", "max"]
+    if not os.environ.get("KIMI_BASE_URL"):
+        assert bot._OPENAI_PROVIDERS["kimi"]["base_url"] == "https://api.kimi.ai/coding/v1"
+    assert bot._OPENAI_PROVIDERS["kimi"]["key"] is bot._resolve_kimi_key
+
+
+def test_kimi_key_resolution(monkeypatch, tmp_path):
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.setattr(bot, "_KIMI_KEY_FILE", tmp_path / "absent")
+    assert bot._resolve_kimi_key() is None
+    (tmp_path / "k").write_text("sk-kimi-file\n")
+    monkeypatch.setattr(bot, "_KIMI_KEY_FILE", tmp_path / "k")
+    assert bot._resolve_kimi_key() == "sk-kimi-file"
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-env")
+    assert bot._resolve_kimi_key() == "sk-kimi-env"
+
+
+def test_stale_kimi_medium_effort_is_dropped(monkeypatch, tmp_path):
+    f = tmp_path / "effort.json"
+    f.write_text('{"kimi-k3": "medium"}', encoding="utf-8")
+    monkeypatch.setattr(bot, "BRIDGE_EFFORT_FILE", f)
+    assert bot.current_effort(bot._model_by_id("kimi-k3")) is None

@@ -392,11 +392,16 @@ def should_ping_now(record: dict, now: float) -> bool:
 # BRIDGE_MODEL_FILE and shown in `!model`.
 # provider="tokenhub" → same host-tool loop against Tencent TokenHub's
 # OpenAI-compatible Token Plan endpoint (api_model is the TokenHub model id).
+# provider="kimi" → same loop against Moonshot's Kimi Code plan API
+# (KIMI_BASE_URL, default api.kimi.ai/coding/v1; key from KIMI_API_KEY or
+# ~/.kimi_code_key). Kimi K3 ran on TokenHub until 2026-09-29; the id stays
+# "kimi-k3" so persisted picks survive.
 # provider="mimo" → same loop against Xiaomi's MiMo Token Plan API
 # (MIMO_BASE_URL, default token-plan-sgp; key from MIMO_API_KEY or ~/.mimo_key).
+_KIMI_MODEL = os.environ.get("KIMI_MODEL", "k3")
 AVAILABLE_MODELS: list[dict] = [
-    {"label": "Kimi K3",           "provider": "tokenhub",  "id": "kimi-k3",  "api_model": "kimi-k3",
-     "effort": ["low", "medium", "high", "max"]},
+    {"label": "Kimi K3",           "provider": "kimi",      "id": "kimi-k3",  "api_model": _KIMI_MODEL,
+     "effort": ["low", "high", "max"]},
     {"label": "GLM-5.3",           "provider": "tokenhub",  "id": "glm-5.3",  "api_model": "glm-5.3",
      "effort": ["low", "high", "max"]},
     {"label": "MiMo V2.6 Pro",     "provider": "mimo",      "id": "mimo-v2.6-pro",   "api_model": "mimo-v2.6-pro",
@@ -430,7 +435,7 @@ AVAILABLE_MODELS: list[dict] = [
 # OpenAI-compatible lists were probed live against each gateway on
 # 2026-09-28: GLM-5.3 always thinks and only takes low/high/max; Qwen and
 # MiniMax reject max/xhigh; DeepSeek validates none/low/medium/high/max;
-# Kimi's gateway accepts any string, so its list is the conservative set.
+# Kimi Code's /models declares low/high/max for k3 (2026-09-29).
 # MiMo V2.6 Pro: effort levels not probed yet (no key on the host as of
 # 2026-09-28) → None until verified; the provider default applies.
 # Unset (`!effort reset`) → no flag/field is sent and the provider default
@@ -529,6 +534,26 @@ _TOKENHUB_KEY_FILE = Path(os.environ.get(
 ))
 
 
+_KIMI_BASE_URL = os.environ.get(
+    "KIMI_BASE_URL", "https://api.kimi.ai/coding/v1"
+).rstrip("/")
+_KIMI_KEY_FILE = Path(os.environ.get(
+    "KIMI_KEY_FILE", str(Path.home() / ".kimi_code_key")
+))
+
+
+def _resolve_kimi_key() -> str | None:
+    """Kimi Code plan key: KIMI_API_KEY env, else the 0600 key file
+    (~/.kimi_code_key). Read per turn so a rotated key needs no restart."""
+    key = os.environ.get("KIMI_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return _KIMI_KEY_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 _MIMO_BASE_URL = os.environ.get(
     "MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"
 ).rstrip("/")
@@ -586,6 +611,11 @@ _OPENAI_PROVIDERS: dict[str, dict] = {
         "base_url": _TOKENHUB_BASE_URL,
         "key": _resolve_tokenhub_key,
         "missing": "no TokenHub key (TOKENHUB_API_KEY or ~/.glm_key)",
+    },
+    "kimi": {
+        "base_url": _KIMI_BASE_URL,
+        "key": _resolve_kimi_key,
+        "missing": "no Kimi Code key (KIMI_API_KEY or ~/.kimi_code_key)",
     },
     "mimo": {
         # base_url is a callable: it depends on which key resolves this turn.
@@ -1003,9 +1033,9 @@ async def _run_haihub(
                         for i, tc in enumerate(tool_calls)
                     ],
                 }
-                # Thinking models on TokenHub (Kimi) and Xiaomi MiMo expect
+                # Thinking models (Kimi, TokenHub GLM, Xiaomi MiMo) expect
                 # their reasoning echoed back on tool-call turns.
-                if provider in ("tokenhub", "mimo") and reasoning_parts:
+                if provider in ("kimi", "tokenhub", "mimo") and reasoning_parts:
                     assistant_msg["reasoning_content"] = "".join(reasoning_parts)
                 messages.append(assistant_msg)
                 for i, tc in enumerate(tool_calls):
@@ -3854,6 +3884,7 @@ async def handle_model(msg: discord.Message, args: str) -> None:
                 "anthropic": " _(Anthropic)_",
                 "tokenhub": " _(TokenHub API, host tools)_",
                 "mimo": " _(Xiaomi MiMo API, host tools)_",
+                "kimi": " _(Kimi Code API, host tools)_",
             }.get(m["provider"], " _(haihub API, host tools)_")
             lines.append(f"{i}. **{m['label']}** (`{m['id']}`){tag}{mark}")
         lines.append("\nSet with `!model set <number>`.")

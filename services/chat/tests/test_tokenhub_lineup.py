@@ -84,7 +84,9 @@ def test_validated_effort():
     assert v("glm", "low") == "low"
     # medium is NOT a served GLM level — must be dropped, never sent.
     assert v("glm", "medium") is None
-    assert v("kimi", "medium") == "medium"
+    # Kimi Code k3 declares low/high/max only (2026-09-29).
+    assert v("kimi", "medium") is None
+    assert v("kimi", "low") == "low"
     assert v("kimi", "max") == "max"
     assert v("deepseek", "none") == "none"
     assert v("qwen", "high") == "high"
@@ -103,6 +105,7 @@ def test_effort_levels_match_runner_lineups():
             tokenhub_runner.is_tokenhub_model(alias)
             or app_module.haihub_runner.is_haihub_model(alias)
             or app_module.mimo_runner.is_mimo_model(alias)
+            or app_module.kimi_runner.is_kimi_model(alias)
         ), alias
 
 
@@ -204,25 +207,6 @@ def test_effort_dropped_when_not_served_for_model(
     assert resp.status_code == 200
     consume_sse(resp)
     assert captured["calls"][0]["effort"] is None
-
-
-def test_kimi_effort_medium_forwarded(
-    client, auth_headers, fake_claude, monkeypatch, drain_background_tasks
-):
-    monkeypatch.setattr(app_module, "CHAT_DEFAULT_MODEL", "glm")
-    captured = _install_fake_tokenhub(monkeypatch)
-    headers = auth_headers(USER_A)
-    sid = create_session(client, headers)
-
-    resp = client.post(
-        f"/api/sessions/{sid}/messages",
-        headers=headers,
-        json={"text": "ping", "model": "kimi", "effort": "medium"},
-    )
-    assert resp.status_code == 200
-    consume_sse(resp)
-    assert captured["calls"][0]["model"] == "kimi"
-    assert captured["calls"][0]["effort"] == "medium"
 
 
 def test_admin_session_tools_target_host_shell(

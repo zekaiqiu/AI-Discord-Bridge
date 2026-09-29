@@ -85,7 +85,7 @@ export const MODEL_LABELS: Record<ModelChoice, string> = {
 // OpenAI-style "disable reasoning" level some gateways accept.
 export const EFFORT_LEVELS: Partial<Record<ModelChoice, string[]>> = {
   glm: ["low", "high", "max"],
-  kimi: ["low", "medium", "high", "max"],
+  kimi: ["low", "high", "max"],
   mimo: ["low", "medium", "high"],
   "mimo-flash": ["low", "medium", "high"],
   qwen: ["none", "low", "medium", "high"],

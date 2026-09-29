@@ -58,6 +58,7 @@ import local_runner
 import token_ledger
 import tokenhub_runner
 import mimo_runner
+import kimi_runner
 import storage
 import user_container
 from session_process import SessionProcessManager
@@ -203,7 +204,8 @@ def _normalize_model(model: str | None) -> str | None:
 # value.
 EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
     "glm": ("low", "high", "max"),
-    "kimi": ("low", "medium", "high", "max"),
+    # Kimi Code (k3) declares low/high/max in /models (2026-09-29).
+    "kimi": ("low", "high", "max"),
     # MiMo Token Plan: low/medium/high accepted, "max" -> HTTP 400 (2026-09-29).
     "mimo": ("low", "medium", "high"),
     "mimo-flash": ("low", "medium", "high"),
@@ -2352,6 +2354,8 @@ def _ledger_provider(model: str | None) -> str:
         return "tokenhub"
     if mimo_runner.is_mimo_model(model):
         return "mimo"
+    if kimi_runner.is_kimi_model(model):
+        return "kimi"
     return "haihub"
 
 
@@ -2362,13 +2366,14 @@ def _ledger_status(run: "_TurnRun") -> str:
 
 
 def _is_api_model(model: str | None) -> bool:
-    """True for the OpenAI-compatible (stateless) runners: TokenHub glm/kimi,
+    """True for the OpenAI-compatible (stateless) runners: TokenHub glm, Kimi Code kimi,
     Xiaomi mimo, haihub qwen/deepseek/minimax, the home-GPU local model."""
     return bool(
         local_runner.is_local_model(model)
         or haihub_runner.is_haihub_model(model)
         or tokenhub_runner.is_tokenhub_model(model)
         or mimo_runner.is_mimo_model(model)
+        or kimi_runner.is_kimi_model(model)
     )
 
 
@@ -2428,6 +2433,7 @@ async def _api_model_turn_gen(
         local_runner if local_runner.is_local_model(model)
         else tokenhub_runner if tokenhub_runner.is_tokenhub_model(model)
         else mimo_runner if mimo_runner.is_mimo_model(model)
+        else kimi_runner if kimi_runner.is_kimi_model(model)
         else haihub_runner
     )
     tool_container = container

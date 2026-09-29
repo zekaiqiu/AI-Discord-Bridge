@@ -586,6 +586,7 @@ def provider_of(base_url: str) -> str:
     """Short provider tag for the token ledger, from the endpoint URL."""
     u = (base_url or "").lower()
     for needle, tag in (("tokenhub", "tokenhub"), ("xiaomimimo", "mimo"),
+                        ("kimi", "kimi"),
                         ("haihub", "haihub"), ("localhost", "local"),
                         ("host.docker.internal", "local")):
         if needle in u:
