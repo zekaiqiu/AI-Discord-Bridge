@@ -44,13 +44,15 @@ def _fake_tokenhub(monkeypatch):
 
     monkeypatch.setattr(app.tokenhub_runner, "run_turn", fake_run_turn)
     monkeypatch.setattr(tokenhub_runner, "run_turn", fake_run_turn)
+    # Kimi (kimi_runner) is the default model since 2026-09-29.
+    monkeypatch.setattr(app.kimi_runner, "run_turn", fake_run_turn)
     return calls
 
 
 def test_wake_runs_on_default_api_model_with_thread_history(
     tmp_sessions_dir, monkeypatch
 ):
-    monkeypatch.setattr(app, "CHAT_DEFAULT_MODEL", "glm")
+    monkeypatch.setattr(app, "CHAT_DEFAULT_MODEL", "kimi")
     monkeypatch.setattr(app, "_persistent_enabled", lambda: False)
     _quiet(monkeypatch)
     calls = _fake_tokenhub(monkeypatch)
@@ -72,7 +74,7 @@ def test_wake_runs_on_default_api_model_with_thread_history(
     assert not claude_calls
     assert len(calls) == 1
     call = calls[0]
-    assert call["model"] == "glm"
+    assert call["model"] == "kimi"
     assert "check the report now" in call["prompt"]
     assert "[Scheduled wake" in call["prompt"]
     assert "please remind me about the report" in (call["prior_history"] or "")

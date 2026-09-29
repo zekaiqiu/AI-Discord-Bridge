@@ -278,7 +278,7 @@ export interface UserSettings {
 }
 
 export const DEFAULT_USER_SETTINGS: UserSettings = {
-  default_model: "glm",
+  default_model: "kimi",
   send_on_enter: true,
   persona: "",
   notify_on_complete: false,

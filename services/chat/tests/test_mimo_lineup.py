@@ -68,7 +68,7 @@ def test_settings_accept_mimo_defaults():
     for alias in MIMO_ALIASES:
         assert storage._coerce_settings({"default_model": alias})["default_model"] == alias
     # unknown values still fall back to the default model
-    assert storage._coerce_settings({"default_model": "nope"})["default_model"] == "glm"
+    assert storage._coerce_settings({"default_model": "nope"})["default_model"] == "kimi"
 
 
 def test_dispatch_reaches_mimo_runner(

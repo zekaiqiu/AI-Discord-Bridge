@@ -97,6 +97,8 @@ def test_run_turn_passes_endpoint_and_model_map(monkeypatch, tmp_path):
 def test_run_turn_without_key_errors(monkeypatch, tmp_path):
     monkeypatch.setattr(kimi_runner, "_KIMI_KEY_FILE", tmp_path / "absent")
     monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.setattr(tokenhub_runner, "_TOKENHUB_KEY_FILE", tmp_path / "absent-th")
+    monkeypatch.delenv("TOKENHUB_API_KEY", raising=False)
     async def collect():
         return [e async for e in kimi_runner.run_turn(model="kimi")]
 

@@ -35,7 +35,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import docker
 import httpx
@@ -250,6 +250,26 @@ def _is_context_overflow(message: str) -> bool:
     return ("http 400" in m or "http 413" in m or "provider error" in m) and any(
         h in m for h in _CONTEXT_OVERFLOW_HINTS
     )
+
+
+# Plan/key exhaustion: the signal to fail over to a caller-supplied fallback
+# endpoint (kimi_runner: Kimi Code plan -> TokenHub). Auth failures count too,
+# so a revoked or rotated-away primary key also falls through.
+_LIMIT_STATUS_RE = re.compile(r"\bHTTP (401|402|403|429)\b", re.IGNORECASE)
+_LIMIT_HINTS = (
+    "rate limit", "rate_limit", "quota", "usage limit", "too many requests",
+    "insufficient", "limit exceeded", "limit reached", "billing", "membership",
+)
+
+
+def _is_limit_error(message: str) -> bool:
+    """True when a step error means the endpoint's plan or key is exhausted
+    or refused (not a context overflow, not a transport failure)."""
+    msg = message or ""
+    if _is_context_overflow(msg):
+        return False
+    m = msg.lower()
+    return bool(_LIMIT_STATUS_RE.search(msg)) or any(h in m for h in _LIMIT_HINTS)
 
 
 def _duplicate_unit_fraction(window: str) -> tuple[float, int]:
@@ -828,6 +848,8 @@ async def run_turn(
     tool_workdir: str = "/workspace",
     tool_home: str = "/workspace",
     artifacts_path: str | None = None,
+    fallback: dict[str, str] | None = None,
+    on_failover: Callable[[str], None] | None = None,
     **_ignored: Any,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one turn from an OpenAI-compatible model as normalized events.
@@ -843,6 +865,11 @@ async def run_turn(
     ``_MAX_TOKENS``. ``tool_workdir``/``tool_home`` retarget the tool execs
     (admin host-shell dispatch passes /home/felix). ``artifacts_path``
     overrides the default ``/workspace/.artifacts/<sid>`` block target.
+
+    ``fallback`` (``{"base_url", "api_key", "model"}``) is a second endpoint
+    for the same model: when a step fails with a limit/auth error before
+    any output, the rest of the turn moves there (once) and the step is
+    redone. ``on_failover(message)`` is called when that happens.
     """
     mmap = models_map or _HAIHUB_MODELS
     base = (base_url or HAIHUB_BASE_URL).rstrip("/")
@@ -1000,6 +1027,7 @@ async def run_turn(
                 meta: dict[str, Any] | None = None
                 step_started = False
                 overflow_retry = False
+                failover_retry = False
                 async for ev in _stream_step(client, payload, base_url=base, api_key=key):
                     t = ev["type"]
                     if t == "delta":
@@ -1033,11 +1061,31 @@ async def run_turn(
                             _compact_tool_history(messages, context_budget, keep_recent=2)
                             overflow_retry = True
                             break
+                        if (not step_started and fallback is not None
+                                and _is_limit_error(ev["message"])):
+                            # Primary plan/key exhausted: finish the turn on
+                            # the fallback endpoint (same model, other key).
+                            logger.warning(
+                                "haihub: %s failed on %s (%s); failing over to %s model=%s",
+                                display, base, ev["message"][:160],
+                                fallback["base_url"], fallback["model"],
+                            )
+                            base = fallback["base_url"].rstrip("/")
+                            key = fallback["api_key"]
+                            display = fallback["model"]
+                            fallback = None
+                            if on_failover is not None:
+                                try:
+                                    on_failover(ev["message"])
+                                except Exception:
+                                    logger.exception("haihub: on_failover callback failed")
+                            failover_retry = True
+                            break
                         yield {"type": "error", "message": ev["message"]}
                         return
                     elif t == "_meta":
                         meta = ev
-                if overflow_retry:
+                if overflow_retry or failover_retry:
                     # Retry the SAME step: a wrap-up stays a wrap-up.
                     wrap_up_nudge = pending_nudge
                     continue

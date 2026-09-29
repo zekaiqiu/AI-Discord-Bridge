@@ -204,7 +204,7 @@ def _session_path(email: str, session_id: str) -> str:
 SETTINGS_FILENAME = "_settings.json"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "default_model": "glm",           # glm | kimi | mimo | mimo-flash | qwen | deepseek | minimax | gemma4-local
+    "default_model": "kimi",          # kimi | glm | mimo | mimo-flash | qwen | deepseek | minimax | gemma4-local
     "send_on_enter": True,            # if False, Enter inserts newline; Cmd/Ctrl+Enter sends
     "persona": "",                    # personal system-prompt prefix, prepended to every turn
     "notify_on_complete": False,      # browser desktop notification when a turn ends

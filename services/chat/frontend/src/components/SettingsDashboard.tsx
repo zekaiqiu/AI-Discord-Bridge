@@ -183,8 +183,8 @@ export function SettingsDashboard({
                   value={settings.default_model}
                   onChange={(e) => patch({ default_model: e.target.value as ModelChoice })}
                 >
-                  <option value="glm">{t("settings.model.glm")}</option>
                   <option value="kimi">{t("settings.model.kimi")}</option>
+                  <option value="glm">{t("settings.model.glm")}</option>
                   <option value="mimo">{t("settings.model.mimo")}</option>
                   <option value="mimo-flash">{t("settings.model.mimo_flash")}</option>
                   <option value="qwen">{t("settings.model.qwen")}</option>

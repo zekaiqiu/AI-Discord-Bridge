@@ -197,12 +197,13 @@ function saveWorkspacePref(value: Workspace): void {
 }
 
 // The served lineup (Anthropic models were removed 2026-09-28; glm/kimi
-// lead). Any stored value outside this set — including the removed
-// claude aliases and "default" — falls back to "glm" so a returning
+// lead; kimi is the default since 2026-09-29). Any stored value outside
+// this set — including the removed claude aliases and "default" — falls
+// back to "kimi" so a returning
 // browser never pins itself to a model the picker no longer offers.
 const SERVED_MODELS: ModelChoice[] = [
-  "glm",
   "kimi",
+  "glm",
   "mimo",
   "mimo-flash",
   "qwen",
@@ -220,11 +221,11 @@ function loadModelPref(): ModelChoice {
   } catch {
     /* localStorage unavailable; fall through */
   }
-  return "glm";
+  return "kimi";
 }
 
 // Cache of the last Settings default seen from the server, so the first
-// paint after a refresh (and a failed /me) uses it instead of "glm".
+// paint after a refresh (and a failed /me) uses it instead of "kimi".
 function saveModelPref(m: ModelChoice): void {
   try {
     localStorage.setItem(MODEL_PREF_KEY, m);

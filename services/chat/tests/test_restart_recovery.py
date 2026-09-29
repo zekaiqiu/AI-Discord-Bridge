@@ -41,6 +41,8 @@ def _fake_tokenhub(monkeypatch):
 
     monkeypatch.setattr(app.tokenhub_runner, "run_turn", fake_run_turn)
     monkeypatch.setattr(tokenhub_runner, "run_turn", fake_run_turn)
+    # Kimi (kimi_runner) is the default model since 2026-09-29.
+    monkeypatch.setattr(app.kimi_runner, "run_turn", fake_run_turn)
     return calls
 
 
@@ -75,7 +77,7 @@ def test_interrupted_turn_is_rerun_on_same_placeholder(tmp_sessions_dir, monkeyp
     assert (recovered, swept) == (1, 0)
     assert len(calls) == 1
     call = calls[0]
-    assert call["model"] == "glm"
+    assert call["model"] == "kimi"
     assert call["prompt"].startswith("please build the report")
     assert "re-run automatically" in call["prompt"]
     assert "earlier question" in (call["prior_history"] or "")

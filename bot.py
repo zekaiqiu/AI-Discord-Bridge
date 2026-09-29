@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -440,7 +441,7 @@ AVAILABLE_MODELS: list[dict] = [
 # 2026-09-28) → None until verified; the provider default applies.
 # Unset (`!effort reset`) → no flag/field is sent and the provider default
 # applies.
-DEFAULT_MODEL_ID = "claude-fable-5-1"
+DEFAULT_MODEL_ID = "kimi-k3"   # #1 default since 2026-09-29
 BRIDGE_MODEL_FILE = Path(os.environ.get(
     "BRIDGE_MODEL_FILE", str(Path.home() / ".cache" / "wizerith-bridge-model")
 ))
@@ -705,6 +706,53 @@ def _qwen_compact_history(messages: list, budget: int,
 def _qwen_is_overflow(error: str) -> bool:
     e = (error or "").lower()
     return ("http 400" in e or "http 413" in e) and any(h in e for h in _QWEN_OVERFLOW_HINTS)
+
+
+# Plan/key exhaustion on the Kimi Code key: the signal to finish the turn on
+# the TokenHub key instead. Auth failures count too, so a revoked or
+# rotated-away key falls through. Mirrors services/chat/haihub_runner.
+_QWEN_LIMIT_STATUS_RE = re.compile(r"\bHTTP (401|402|403|429)\b", re.IGNORECASE)
+_QWEN_LIMIT_HINTS = (
+    "rate limit", "rate_limit", "quota", "usage limit", "too many requests",
+    "insufficient", "limit exceeded", "limit reached", "billing", "membership",
+)
+
+
+def _qwen_is_limit(error: str) -> bool:
+    e = error or ""
+    if _qwen_is_overflow(e):
+        return False
+    return bool(_QWEN_LIMIT_STATUS_RE.search(e)) or any(h in e.lower() for h in _QWEN_LIMIT_HINTS)
+
+
+# Kimi K3 fallback: TokenHub serves the same model as "kimi-k3". After a
+# limit error, later turns skip Kimi Code for this long before retrying it.
+_KIMI_TOKENHUB_MODEL = "kimi-k3"
+_KIMI_FAILOVER_COOLDOWN_SEC = float(os.environ.get("KIMI_FAILOVER_COOLDOWN_SEC", "900"))
+_kimi_primary_down_until = 0.0
+
+
+def _kimi_mark_down(error: str) -> None:
+    global _kimi_primary_down_until
+    _kimi_primary_down_until = time.monotonic() + _KIMI_FAILOVER_COOLDOWN_SEC
+    log.warning("kimi: Kimi Code unavailable (%s); using TokenHub for %.0fs",
+                (error or "")[:160], _KIMI_FAILOVER_COOLDOWN_SEC)
+
+
+def _kimi_endpoints(api_model: str) -> tuple[dict | None, dict | None]:
+    """``(primary, fallback)`` for a Kimi turn, each ``{"provider",
+    "base_url", "key", "model"}`` or None. Kimi Code leads unless it has no
+    key or is cooling down after a limit error; TokenHub backs it up."""
+    kk, tk = _resolve_kimi_key(), _resolve_tokenhub_key()
+    kimi = ({"provider": "kimi", "base_url": _KIMI_BASE_URL, "key": kk, "model": api_model}
+            if kk else None)
+    th = ({"provider": "tokenhub", "base_url": _TOKENHUB_BASE_URL, "key": tk,
+           "model": _KIMI_TOKENHUB_MODEL} if tk else None)
+    if kimi and time.monotonic() >= _kimi_primary_down_until:
+        return kimi, th
+    if th:
+        return th, None
+    return kimi, None
 _QWEN_MAX_TOOL_OUTPUT = 16000     # chars of tool output fed back to the model
 _QWEN_REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
 
@@ -954,10 +1002,18 @@ async def _run_haihub(
     name for the system prompt; ``emergency`` tweaks the prompt wording;
     ``effort`` (if set) is sent as OpenAI-style ``reasoning_effort``."""
     prov = _OPENAI_PROVIDERS[provider]
-    key = prov["key"]()
-    if not key:
-        return (f"[{provider} provider unavailable: {prov['missing']}]", route)
-    base_url = prov["base_url"]() if callable(prov["base_url"]) else prov["base_url"]
+    fallback: dict | None = None
+    if provider == "kimi":
+        primary, fallback = _kimi_endpoints(haihub_model)
+        if primary is None:
+            return (f"[kimi provider unavailable: {prov['missing']} and no TokenHub key]", route)
+        provider, base_url, key, haihub_model = (
+            primary["provider"], primary["base_url"], primary["key"], primary["model"])
+    else:
+        key = prov["key"]()
+        if not key:
+            return (f"[{provider} provider unavailable: {prov['missing']}]", route)
+        base_url = prov["base_url"]() if callable(prov["base_url"]) else prov["base_url"]
 
     messages: list[dict] = [
         {"role": "system", "content": _haihub_system_prompt(label, emergency=emergency)},
@@ -1012,6 +1068,17 @@ async def _run_haihub(
                     log.warning("%s context overflow (%s); compacting to %d chars and retrying",
                                 provider, error[:160], context_budget)
                     _qwen_compact_history(messages, context_budget, keep_recent=2)
+                    continue
+                if (error is not None and not content and fallback is not None
+                        and _qwen_is_limit(error)):
+                    # Kimi Code plan/key exhausted: finish the turn on the
+                    # TokenHub key (same model) and redo this step.
+                    log.warning("%s failed (%s); failing over to %s model=%s",
+                                provider, error[:160], fallback["provider"], fallback["model"])
+                    _kimi_mark_down(error)
+                    provider, base_url, key, haihub_model = (
+                        fallback["provider"], fallback["base_url"], fallback["key"], fallback["model"])
+                    fallback = None
                     continue
                 if error is not None:
                     text_parts.append(f"\n[{label} error: {error}]")

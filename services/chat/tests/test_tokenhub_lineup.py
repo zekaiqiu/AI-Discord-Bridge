@@ -243,7 +243,7 @@ def test_admin_session_tools_target_host_shell(
 # Settings coercion (free migration of pre-change blobs)
 # ---------------------------------------------------------------------------
 
-def test_settings_reject_removed_alias_and_coerce_to_glm(
+def test_settings_reject_removed_alias_and_coerce_to_default(
     client, auth_headers, monkeypatch
 ):
     headers = auth_headers(USER_A)
@@ -254,8 +254,8 @@ def test_settings_reject_removed_alias_and_coerce_to_glm(
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["default_model"] == "glm"
+    assert body["default_model"] == "kimi"
 
     # And it round-trips through GET.
     resp = client.get("/api/settings", headers=headers)
-    assert resp.json()["default_model"] == "glm"
+    assert resp.json()["default_model"] == "kimi"
