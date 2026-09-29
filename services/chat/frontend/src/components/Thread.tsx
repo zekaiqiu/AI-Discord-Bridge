@@ -138,6 +138,7 @@ const INITIAL_WINDOW = 30;
 const WINDOW_STEP = 50;
 
 export function Thread({ sessionId, messages, streaming, onForkAndResend }: ThreadProps): JSX.Element {
+  const thinkingMode = useContext(ThinkingModeContext);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef<boolean>(true);
   const [visibleCount, setVisibleCount] = useState<number>(INITIAL_WINDOW);
@@ -255,7 +256,8 @@ export function Thread({ sessionId, messages, streaming, onForkAndResend }: Thre
                 isLast &&
                 m.role === "assistant" &&
                 m.content === "" &&
-                !(m.reasoning && m.reasoning.length > 0) &&
+                // Reasoning only counts as content when it is displayed.
+                !(thinkingMode !== "off" && m.reasoning && m.reasoning.length > 0) &&
                 !trailingWakePlaceholder;
               if (isEmptyStreamingPlaceholder) return null;
               return (

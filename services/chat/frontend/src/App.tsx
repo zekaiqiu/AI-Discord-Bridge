@@ -223,6 +223,16 @@ function loadModelPref(): ModelChoice {
   return "glm";
 }
 
+// Cache of the last Settings default seen from the server, so the first
+// paint after a refresh (and a failed /me) uses it instead of "glm".
+function saveModelPref(m: ModelChoice): void {
+  try {
+    localStorage.setItem(MODEL_PREF_KEY, m);
+  } catch {
+    /* ignore */
+  }
+}
+
 function loadEffortMap(): Record<string, string> {
   try {
     const raw = localStorage.getItem(EFFORT_PREF_KEY);
@@ -358,14 +368,15 @@ function savePaneModel(paneKey: string, model: ModelChoice | null): void {
 // pane so toggling web-search (or attaching a file) in one window doesn't
 // leak into another.
 interface PaneEphem {
-  model: ModelChoice;
+  // null = no pick in this window: follow the Settings default (`model`).
+  model: ModelChoice | null;
   webSearchOn: boolean;
   imageGenOn: boolean;
   pendingAttachments: AttachmentMeta[];
   pendingFiles: File[];
 }
 
-function defaultPaneEphem(model: ModelChoice): PaneEphem {
+function defaultPaneEphem(model: ModelChoice | null = null): PaneEphem {
   return {
     model,
     webSearchOn: false,
@@ -741,12 +752,15 @@ export function App(): JSX.Element {
 
   // --- per-pane composer ephemerals -----------------------------------
   const getPaneEphem = useCallback(
-    (key: string): PaneEphem => paneEphem.get(key) ?? defaultPaneEphem(model),
+    (key: string): PaneEphem & { model: ModelChoice } => {
+      const e = paneEphem.get(key) ?? defaultPaneEphem();
+      return { ...e, model: e.model ?? model };
+    },
     [paneEphem, model],
   );
   const updatePaneEphem = useCallback((key: string, patch: Partial<PaneEphem>) => {
     setPaneEphem((prev) => {
-      const cur = prev.get(key) ?? defaultPaneEphem(modelRef.current);
+      const cur = prev.get(key) ?? defaultPaneEphem();
       const next = new Map(prev);
       next.set(key, { ...cur, ...patch });
       return next;
@@ -877,6 +891,7 @@ export function App(): JSX.Element {
           // localStorage in loadModelPref).
           if (meResp.settings.default_model && meResp.settings.default_model !== "default") {
             setModel(meResp.settings.default_model);
+            saveModelPref(meResp.settings.default_model);
           }
         }
       } catch (err) {
@@ -992,9 +1007,11 @@ export function App(): JSX.Element {
     }
   }, [currentSessionId]);
 
-  // Persist the active session id so a refresh restores it.
+  // Persist the active session id so a refresh restores it. Null is not
+  // written: on the first render nothing is loaded yet, and clearing here
+  // wiped the key before boot could read it.
   useEffect(() => {
-    saveLastSessionId(currentSessionId);
+    if (currentSessionId) saveLastSessionId(currentSessionId);
   }, [currentSessionId]);
 
   // Apply theme to <html data-theme=...>. CSS targets the attribute to
@@ -1709,7 +1726,7 @@ export function App(): JSX.Element {
       mime: f.type,
     }));
     setPaneEphem((prev) => {
-      const cur = prev.get(paneKey) ?? defaultPaneEphem(modelRef.current);
+      const cur = prev.get(paneKey) ?? defaultPaneEphem();
       const next = new Map(prev);
       next.set(paneKey, {
         ...cur,
@@ -2034,7 +2051,8 @@ export function App(): JSX.Element {
   const handleSend = useCallback(
     async (paneKey: string, text: string) => {
       const trimmed = text.trim();
-      const eph = paneEphemRef.current.get(paneKey) ?? defaultPaneEphem(modelRef.current);
+      const eph = paneEphemRef.current.get(paneKey) ?? defaultPaneEphem();
+      const ephModel = eph.model ?? modelRef.current;
       // Allow an attachments-only send (no text). pendingFiles are the
       // freshly-staged uploads; pendingAttachments covers rehydrated meta.
       const hasAttachments =
@@ -2105,15 +2123,20 @@ export function App(): JSX.Element {
         }
       }
       // Reset per-send ephemerals (toggles + attachments) for this pane.
+      // Only what this send snapshotted: files attached or toggles flipped
+      // while it was creating the session / uploading belong to the next
+      // message and must survive.
       setPaneEphem((prev) => {
-        const cur = prev.get(paneKey) ?? defaultPaneEphem(modelRef.current);
+        const cur = prev.get(paneKey) ?? defaultPaneEphem();
         const next = new Map(prev);
         next.set(paneKey, {
           ...cur,
-          webSearchOn: false,
-          imageGenOn: false,
-          pendingAttachments: [],
-          pendingFiles: [],
+          webSearchOn: cur.webSearchOn === eph.webSearchOn ? false : cur.webSearchOn,
+          imageGenOn: cur.imageGenOn === eph.imageGenOn ? false : cur.imageGenOn,
+          pendingAttachments: cur.pendingAttachments.filter(
+            (a) => !eph.pendingAttachments.includes(a),
+          ),
+          pendingFiles: cur.pendingFiles.filter((f) => !eph.pendingFiles.includes(f)),
         });
         return next;
       });
@@ -2121,13 +2144,13 @@ export function App(): JSX.Element {
       // Effort for the pane's model, re-validated against its supported
       // levels (a stored level for a different model must not leak into
       // this turn's payload).
-      const ephLevels = EFFORT_LEVELS[eph.model];
+      const ephLevels = EFFORT_LEVELS[ephModel];
       const ephEffort =
-        ephLevels && effortMapRef.current[eph.model] && ephLevels.includes(effortMapRef.current[eph.model])
-          ? effortMapRef.current[eph.model]
+        ephLevels && effortMapRef.current[ephModel] && ephLevels.includes(effortMapRef.current[ephModel])
+          ? effortMapRef.current[ephModel]
           : null;
       await runTurn(sid, textToSend, {
-        model: eph.model,
+        model: ephModel,
         effort: ephEffort,
         webSearch: eph.webSearchOn,
         imageGen: eph.imageGenOn,
@@ -2213,11 +2236,11 @@ export function App(): JSX.Element {
   // The new session inherits messages with seq < fromSeq; the worker
   // assembles a context preamble in claude_runner.run_turn so the new
   // claude session continues coherently.
-  // Fork happens from the focused window: branch its session, load the
-  // fork into that same window, and resend with the focused pane's model.
+  // Fork happens from the window the edit came from (not the focused one:
+  // keyboard focus can sit in another window): branch its session, load
+  // the fork into that same window, and resend with that pane's model.
   const onForkAndResend = useCallback(
-    async (fromSeq: number, newText: string) => {
-      const srcPaneKey = focusedPaneKeyRef.current;
+    async (srcPaneKey: string, fromSeq: number, newText: string) => {
       const srcPane = panesRef.current.find((p) => p.key === srcPaneKey);
       const srcSid = srcPane?.sessionId ?? null;
       if (!srcSid) return;
@@ -2232,14 +2255,15 @@ export function App(): JSX.Element {
         setPanes((prev) =>
           prev.map((p) => (p.key === srcPaneKey ? { ...p, sessionId: created.id } : p)),
         );
-        const eph = paneEphemRef.current.get(srcPaneKey) ?? defaultPaneEphem(modelRef.current);
-        const forkLevels = EFFORT_LEVELS[eph.model];
+        const eph = paneEphemRef.current.get(srcPaneKey) ?? defaultPaneEphem();
+        const forkModel = eph.model ?? modelRef.current;
+        const forkLevels = EFFORT_LEVELS[forkModel];
         const forkEffort =
-          forkLevels && effortMapRef.current[eph.model] && forkLevels.includes(effortMapRef.current[eph.model])
-            ? effortMapRef.current[eph.model]
+          forkLevels && effortMapRef.current[forkModel] && forkLevels.includes(effortMapRef.current[forkModel])
+            ? effortMapRef.current[forkModel]
             : null;
         await runTurn(created.id, newText, {
-          model: eph.model,
+          model: forkModel,
           effort: forkEffort,
           webSearch: false,
           imageGen: false,
@@ -2335,6 +2359,7 @@ export function App(): JSX.Element {
               setSettings(next);
               if (next.default_model && next.default_model !== "default") {
                 setModel(next.default_model);
+                saveModelPref(next.default_model);
               }
             }}
           />

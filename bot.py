@@ -585,9 +585,13 @@ _QWEN_TOOL_TIMEOUT = int(os.environ.get("BRIDGE_TOOL_TIMEOUT_SEC", "3600"))
 _QWEN_CONTEXT_CHAR_BUDGET = int(os.environ.get("BRIDGE_CONTEXT_CHAR_BUDGET", "400000"))
 _QWEN_CONTEXT_KEEP_RECENT = 8
 _QWEN_CONTEXT_MIN_BUDGET = 40000
+# Specific phrases only (bare "exceeds"/"maximum" also match max_tokens and
+# rate-limit errors). Mirrors services/chat/haihub_runner.py.
 _QWEN_OVERFLOW_HINTS = (
-    "context", "too long", "maximum", "max_tokens", "token limit",
-    "tokens exceed", "input length", "prompt is too long", "exceeds",
+    "context length", "context window", "maximum context", "context_length",
+    "too long", "input length", "prompt is too long", "input tokens exceed",
+    "prompt tokens exceed",
+    "token limit", "too many tokens",
 )
 
 
@@ -630,6 +634,22 @@ def _qwen_compact_history(messages: list, budget: int,
             rc = messages[i].pop("reasoning_content", None)
             if isinstance(rc, str):
                 total -= len(rc)
+    # Then old tool-call arguments (heredoc file writes grow without bound);
+    # ids and call/result pairing are kept.
+    if total > budget:
+        asst = [i for i, m in enumerate(messages)
+                if m.get("role") == "assistant" and m.get("tool_calls")]
+        for i in (asst[:-keep_recent] if keep_recent else asst):
+            if total <= budget:
+                break
+            for tc in messages[i]["tool_calls"]:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments") or ""
+                if len(args) <= 200 or args.startswith('{"elided"'):
+                    continue
+                stub = json.dumps({"elided": f"{len(args)} chars of earlier arguments"})
+                total -= len(args) - len(stub)
+                fn["arguments"] = stub
     return elided
 
 

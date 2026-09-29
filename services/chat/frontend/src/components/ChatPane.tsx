@@ -13,6 +13,7 @@
  * (`showHeader`); a lone window looks exactly like the pre-multi-window UI.
  */
 
+import { useCallback } from "react";
 import { AttachmentMeta, Message, ModelChoice, Workspace } from "../api";
 import { useT } from "../i18n";
 import { ThinkingMode, ThinkingModeContext } from "../thinkingMode";
@@ -34,7 +35,9 @@ export interface ChatPaneProps {
   canClose: boolean;
   onFocus: () => void;
   onClose: () => void;
-  onForkAndResend?: (fromSeq: number, newText: string) => void;
+  /** Fork from this pane; ChatPane binds its own paneKey (stable, so the
+   *  memoized message bubbles below don't re-render on every App render). */
+  onForkAndResend?: (paneKey: string, fromSeq: number, newText: string) => void;
 
   // ---- composer (all per-pane) ----
   /** Draft storage key for this window (see draftStore); Composer owns the
@@ -96,6 +99,10 @@ export function ChatPane(props: ChatPaneProps): JSX.Element {
     workspace,
   } = props;
   const t = useT();
+  const forkFromPane = useCallback(
+    (fromSeq: number, newText: string) => onForkAndResend?.(paneKey, fromSeq, newText),
+    [onForkAndResend, paneKey],
+  );
   const displayTitle = sessionId
     ? title || t("session.untitled")
     : t("pane.new_window_title");
@@ -137,7 +144,7 @@ export function ChatPane(props: ChatPaneProps): JSX.Element {
           sessionId={sessionId}
           messages={messages}
           streaming={streaming}
-          onForkAndResend={onForkAndResend}
+          onForkAndResend={onForkAndResend ? forkFromPane : undefined}
         />
       </ThinkingModeContext.Provider>
       <Composer

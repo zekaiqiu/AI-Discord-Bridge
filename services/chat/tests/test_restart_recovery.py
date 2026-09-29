@@ -18,7 +18,7 @@ def _quiet(monkeypatch):
     async def _noop_img(session_id):
         return None
 
-    async def _noop_sched(session_id, email):
+    async def _noop_sched(session_id, email, errors=None):
         return 0
 
     monkeypatch.setattr(app, "_process_image_requests", _noop_img)

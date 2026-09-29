@@ -39,6 +39,7 @@ from typing import Any, AsyncIterator
 
 import docker
 import httpx
+from concurrent.futures import ThreadPoolExecutor
 
 import prompt_blocks
 
@@ -89,6 +90,14 @@ _TOOL_TIMEOUT = int(os.environ.get("CHAT_TOOL_TIMEOUT_SEC", "3600"))
 # _compact_tool_history. Set CHAT_MAX_TOOL_STEPS to reinstate a cap; when it
 # is reached the model gets one final no-tools call to answer from its work.
 _MAX_STEPS = int(os.environ.get("CHAT_MAX_TOOL_STEPS", "0"))
+# run_bash blocks a thread for up to _TOOL_TIMEOUT, and Stop cannot cancel the
+# thread. On asyncio's shared default pool (min(32, cpus+4) threads) a few
+# long or abandoned commands would starve every other to_thread user in the
+# app (container ensure, wake claims, artifact collection). Own pool instead.
+_BASH_POOL = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("CHAT_BASH_THREADS", "64")),
+    thread_name_prefix="run_bash",
+)
 
 # CONTEXT BUDGET for one turn's message list. With no step cap, tool output
 # accumulates without bound (16k chars per call) and would eventually overflow
@@ -101,9 +110,14 @@ _MAX_STEPS = int(os.environ.get("CHAT_MAX_TOOL_STEPS", "0"))
 _CONTEXT_CHAR_BUDGET = int(os.environ.get("CHAT_CONTEXT_CHAR_BUDGET", "400000"))
 _CONTEXT_KEEP_RECENT_TOOLS = 8
 _CONTEXT_MIN_BUDGET = 40000
+# Specific phrases only: bare "exceeds" / "maximum" also match rate-limit and
+# max_tokens errors, which would then be "fixed" by eliding history and
+# retrying ~4 times before the real error surfaced.
 _CONTEXT_OVERFLOW_HINTS = (
-    "context", "too long", "maximum", "max_tokens", "token limit",
-    "tokens exceed", "input length", "prompt is too long", "exceeds",
+    "context length", "context window", "maximum context", "context_length",
+    "too long", "input length", "prompt is too long", "input tokens exceed",
+    "prompt tokens exceed",
+    "token limit", "too many tokens",
 )
 _CAP_NUDGE = (
     "You have used the maximum number of tool calls allowed in one turn. "
@@ -211,6 +225,22 @@ def _compact_tool_history(
             rc = messages[i].pop("reasoning_content", None)
             if isinstance(rc, str):
                 total -= len(rc)
+    # Then old tool-call arguments (heredoc file writes grow without bound).
+    # Ids and the call/result pairing are kept; only the argument text goes.
+    if total > budget:
+        asst = [i for i, m in enumerate(messages)
+                if m.get("role") == "assistant" and m.get("tool_calls")]
+        for i in asst[:-keep_recent] if keep_recent else asst:
+            if total <= budget:
+                break
+            for tc in messages[i]["tool_calls"]:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments") or ""
+                if len(args) <= 200 or args.startswith('{"elided"'):
+                    continue
+                stub = json.dumps({"elided": f"{len(args)} chars of earlier arguments"})
+                total -= len(args) - len(stub)
+                fn["arguments"] = stub
     return elided
 
 
@@ -532,7 +562,8 @@ async def _exec_bash(
 
     try:
         code, out = await asyncio.wait_for(
-            asyncio.to_thread(_run), timeout=_TOOL_TIMEOUT + 15
+            asyncio.get_running_loop().run_in_executor(_BASH_POOL, _run),
+            timeout=_TOOL_TIMEOUT + 15
         )
     except asyncio.TimeoutError:
         return f"[run_bash timed out after {_TOOL_TIMEOUT}s]"
@@ -696,7 +727,9 @@ async def _stream_step(
         # trusted.
         # The stripper may hold back a few chars pending a possible tag;
         # they are real text and belong to the step (before any trim).
-        tail = stripper.flush()
+        # If the loop was inside an unclosed <think>, flush() would return the
+        # whole hidden reasoning as visible text: drop it instead.
+        tail = "" if stripper._inside else stripper.flush()
         if tail:
             content_parts.append(tail)
             yield {"type": "delta", "text": tail}
@@ -899,6 +932,7 @@ async def run_turn(
                 # OpenAI-style reasoning-effort control. Callers pre-validate
                 # the level against the model's supported set (app.py), so
                 # an unset/empty value simply means "provider default".
+                pending_nudge = wrap_up_nudge
                 if wrap_up_nudge is not None:
                     payload["reasoning_effort"] = _RETRY_EFFORT
                     payload["messages"] = messages + [
@@ -958,6 +992,8 @@ async def run_turn(
                     elif t == "_meta":
                         meta = ev
                 if overflow_retry:
+                    # Retry the SAME step: a wrap-up stays a wrap-up.
+                    wrap_up_nudge = pending_nudge
                     continue
                 if meta is None:
                     yield {"type": "error", "message": "haihub: empty response stream"}

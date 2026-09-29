@@ -230,7 +230,8 @@ def test_reasoning_is_streamed_and_persisted_on_meta(
     r = client.post(f"/api/sessions/{sid}/messages", headers=headers, json={"text": "ping", "model": "glm"})
     events = consume_sse(r)
     reasoning = [e["data"]["text"] for e in events if e["event"] == "reasoning"]
-    assert reasoning == ["first I ", "consider"]
+    # Chunks may arrive merged (the replay log coalesces them); the text is what matters.
+    assert "".join(reasoning) == "first I consider"
     done = [e for e in events if e["event"] == "done"][0]
     assert done["data"]["full_text"] == "hi"
     assert done["data"]["meta"]["reasoning"] == "first I consider"

@@ -1536,7 +1536,25 @@ async def _process_image_requests(*, session_id: str) -> None:
 _SCHEDULE_REQUEST_PREFIX = "_schedule_request_"
 
 
-async def _process_schedule_requests(*, session_id: str, email: str) -> int:
+# Timing keys models write instead of in/at/every. Accepted rather than
+# failing the wake the reply already promised.
+_SCHEDULE_KEY_ALIASES = {
+    "in": ("in", "delay", "after", "in_seconds"),
+    "at": ("at", "when", "time", "datetime"),
+    "every": ("every", "interval", "repeat"),
+}
+
+
+def _schedule_spec_value(spec: dict, key: str) -> Any:
+    for k in _SCHEDULE_KEY_ALIASES[key]:
+        if spec.get(k) is not None:
+            return spec[k]
+    return None
+
+
+async def _process_schedule_requests(
+    *, session_id: str, email: str, errors: list[str] | None = None,
+) -> int:
     """Register a durable wake for every ``_schedule_request_*.json`` marker the
     model dropped under /data/generated/<sid>/ this turn. Returns how many were
     registered (so the caller can notify the UI only when something changed).
@@ -1568,9 +1586,12 @@ async def _process_schedule_requests(*, session_id: str, email: str) -> int:
             if not prompt:
                 raise ValueError("marker needs a non-empty 'prompt'")
             note = spec.get("note")
-            delay = chat_scheduler.parse_duration(spec.get("in")) if spec.get("in") is not None else None
-            at_epoch = chat_scheduler.parse_at(spec.get("at")) if spec.get("at") is not None else None
-            every = chat_scheduler.parse_duration(spec.get("every")) if spec.get("every") is not None else None
+            v_in = _schedule_spec_value(spec, "in")
+            v_at = _schedule_spec_value(spec, "at")
+            v_every = _schedule_spec_value(spec, "every")
+            delay = chat_scheduler.parse_duration(v_in) if v_in is not None else None
+            at_epoch = chat_scheduler.parse_at(v_at) if v_at is not None else None
+            every = chat_scheduler.parse_duration(v_every) if v_every is not None else None
             if delay is None and at_epoch is None and every is None:
                 raise ValueError("marker needs one of 'in', 'at', or 'every'")
             rec = chat_scheduler.register(
@@ -1590,6 +1611,8 @@ async def _process_schedule_requests(*, session_id: str, email: str) -> int:
             )
         finally:
             if err is not None:
+                if errors is not None:
+                    errors.append(err)
                 try:
                     (gen_dir / (p.stem + ".schedule_error")).write_text(
                         f"could not schedule wake: {err}\n", encoding="utf-8",
@@ -1758,7 +1781,9 @@ async def create_session(
     # quotas are tight — the user just sees the rate-limit naturally.
     account_name: str | None = None
     try:
-        choice = account_router.pick()
+        # pick() does blocking HTTP (usage probes, 10s timeout per account):
+        # off the event loop, or every live SSE stream stalls behind it.
+        choice = await asyncio.to_thread(account_router.pick)
         account_name = choice.name
     except account_router.NoAccountsAvailable:
         # No usable pooled account. Leave the session unpinned: the runner
@@ -2151,14 +2176,35 @@ class _TurnRun:
         self.done_event = asyncio.Event()
         self.terminal: dict[str, Any] | None = None
         self.cancel_requested = False
+        self._reasoning_logged = 0
 
     async def emit(self, event: dict[str, Any]) -> None:
-        """Append an event to the log and broadcast to every subscriber."""
+        """Append an event to the log and broadcast to every subscriber.
+
+        The replay log coalesces consecutive text-only delta / reasoning
+        events (a turn with no step cap can stream millions of tiny chunks),
+        and stops logging reasoning past REASONING_PERSIST_CAP. Live
+        subscribers still get every event as sent."""
         async with self._lock:
-            self.events.append(event)
+            self._log(event)
             for q in self._subscribers:
                 # put_nowait is safe: queues are unbounded.
                 q.put_nowait(event)
+
+    def _log(self, event: dict[str, Any]) -> None:
+        et = event.get("type")
+        if et in ("delta", "reasoning") and event.keys() == {"type", "text"}:
+            text = event.get("text") or ""
+            if et == "reasoning":
+                if self._reasoning_logged > REASONING_PERSIST_CAP:
+                    return
+                self._reasoning_logged += len(text)
+            last = self.events[-1] if self.events else None
+            if last is not None and last.get("type") == et and last.keys() == {"type", "text"}:
+                # New dict: the old one may still sit in a subscriber queue.
+                self.events[-1] = {"type": et, "text": (last.get("text") or "") + text}
+                return
+        self.events.append(event)
 
     async def finalize(self, terminal: dict[str, Any]) -> None:
         """Record the terminal event and wake up subscribers' drain loops.
@@ -2477,6 +2523,7 @@ async def _consume_into_run(
     session_id = run.session_id
     assistant_seq = run.assistant_seq
     reasoning_parts: list[str] = []
+    reasoning_len = 0  # stop collecting past the persist cap
     async for event in gen:
         if run.cancel_requested:
             break
@@ -2491,7 +2538,9 @@ async def _consume_into_run(
             # message meta at ``done``. Never joins full_text_parts.
             rchunk = event.get("text") or ""
             if rchunk:
-                reasoning_parts.append(rchunk)
+                if reasoning_len <= REASONING_PERSIST_CAP:
+                    reasoning_parts.append(rchunk)
+                    reasoning_len += len(rchunk)
                 await run.emit({"type": "reasoning", "text": rchunk})
         elif et == "tool_start":
             await run.emit({
@@ -2530,15 +2579,23 @@ async def _consume_into_run(
                 logger.exception(
                     "image-request processing failed for %s", session_id,
                 )
+            _sched_errs: list[str] = []
             try:
                 _scheduled_n = await _process_schedule_requests(
-                    session_id=session_id, email=email,
+                    session_id=session_id, email=email, errors=_sched_errs,
                 )
             except Exception:
                 logger.exception(
                     "schedule-request processing failed for %s", session_id,
                 )
                 _scheduled_n = 0
+            if _sched_errs:
+                # The reply may already say a wake is set; say it isn't.
+                _sched_md = "".join(
+                    f"\n\n⚠ Wake not scheduled: {e}" for e in _sched_errs
+                )
+                assistant_text = assistant_text.rstrip() + _sched_md
+                await run.emit({"type": "delta", "text": _sched_md})
             artifacts = _scan_new_artifacts(
                 session_id=session_id, since_ts=turn_start_ts,
             )
@@ -3236,6 +3293,7 @@ async def _run_turn_worker(
         run._gen = gen  # type: ignore[attr-defined]
 
         reasoning_parts: list[str] = []
+        reasoning_len = 0  # stop collecting past the persist cap
         async for event in gen:
             # Honour an explicit cancel BEFORE forwarding the event.  The
             # cancel handler also aclose()s the gen, so we usually exit
@@ -3254,7 +3312,9 @@ async def _run_turn_worker(
                 # message meta at ``done``. Never joins full_text_parts.
                 rchunk = event.get("text") or ""
                 if rchunk:
-                    reasoning_parts.append(rchunk)
+                    if reasoning_len <= REASONING_PERSIST_CAP:
+                        reasoning_parts.append(rchunk)
+                        reasoning_len += len(rchunk)
                     await run.emit({"type": "reasoning", "text": rchunk})
             elif et == "tool_start":
                 await run.emit({
@@ -3311,15 +3371,23 @@ async def _run_turn_worker(
                     logger.exception(
                         "image-request processing failed for %s", session_id,
                     )
+                _sched_errs: list[str] = []
                 try:
                     _scheduled_n = await _process_schedule_requests(
-                        session_id=session_id, email=email,
+                        session_id=session_id, email=email, errors=_sched_errs,
                     )
                 except Exception:
                     logger.exception(
                         "schedule-request processing failed for %s", session_id,
                     )
                     _scheduled_n = 0
+                if _sched_errs:
+                    # The reply may already say a wake is set; say it isn't.
+                    _sched_md = "".join(
+                        f"\n\n⚠ Wake not scheduled: {e}" for e in _sched_errs
+                    )
+                    assistant_text = assistant_text.rstrip() + _sched_md
+                    await run.emit({"type": "delta", "text": _sched_md})
                 artifacts = _scan_new_artifacts(
                     session_id=session_id, since_ts=turn_start_ts,
                 )
@@ -3832,7 +3900,7 @@ async def post_message(
         healed_fields["role"] = _resolve_role(email)
     if not session.get("account"):
         try:
-            healed_fields["account"] = account_router.pick().name
+            healed_fields["account"] = (await asyncio.to_thread(account_router.pick)).name
         except Exception:
             # Saturated/dead pool: the glm/kimi path does not need one, and a
             # 500 here would block the turn for nothing.

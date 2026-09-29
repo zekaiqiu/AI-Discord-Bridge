@@ -52,3 +52,24 @@ def test_overflow_detector():
     assert f("haihub HTTP 413: input length too long")
     assert not f("tokenhub HTTP 401: invalid key")
     assert not f("tokenhub HTTP 429: rate limited")
+
+
+def test_overflow_detector_ignores_generic_exceeds():
+    f = bot._qwen_is_overflow
+    assert f("http 400: maximum context length exceeded")
+    assert not f("http 400: max_tokens exceeds model maximum")
+    assert not f("http 400: rate limit exceeds quota")
+
+
+def test_compaction_elides_old_tool_call_arguments():
+    import json
+    big = json.dumps({"command": "x" * 50000})
+    msgs = [{"role": "user", "content": "u"}]
+    for i in range(12):
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {"name": "run_bash", "arguments": big}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "ok"})
+    bot._qwen_compact_history(msgs, 450000, keep_recent=8)
+    assert sum(bot._qwen_msg_chars(m) for m in msgs) <= 450000
+    assert [tc["id"] for m in msgs if m.get("tool_calls") for tc in m["tool_calls"]] == [f"c{i}" for i in range(12)]
+    assert msgs[-2]["tool_calls"][0]["function"]["arguments"] == big
