@@ -172,11 +172,11 @@ class RenameSessionBody(BaseModel):
 # pytest suite runs there, hermetically.
 # ---------------------------------------------------------------------------
 CHAT_DEFAULT_MODEL = os.environ.get("CHAT_DEFAULT_MODEL", "").strip()
-# "mimo" (MiMo V2.6 Pro) is parked as of 2026-09-28: mimo_runner stays in
-# the tree but the alias is out of the lineup until a key with MiMo scope
-# exists, so a stored/POSTed "mimo" normalizes to the default model.
+# "mimo" / "mimo-flash" (MiMo V2.6 Pro / Flash) served since 2026-09-29 on
+# the Xiaomi Token Plan key in ~/.mimo_key (see mimo_runner).
 NON_CLAUDE_MODELS = frozenset({
-    "glm", "kimi", "qwen", "deepseek", "minimax", "gemma4-local",
+    "glm", "kimi", "mimo", "mimo-flash", "qwen", "deepseek", "minimax",
+    "gemma4-local",
 })
 
 
@@ -197,13 +197,15 @@ def _normalize_model(model: str | None) -> str | None:
 # DeepSeek, Qwen and MiniMax reject unsupported values (so an invalid
 # stored/POSTed level must never reach the payload), while Kimi's gateway
 # accepts any string (its set is the conservative subset). Models without
-# an entry (mimo — levels not yet probed, no key on the host as of
-# 2026-09-28; gemma4-local; claude aliases in legacy mode) offer no effort
+# an entry (gemma4-local; claude aliases in legacy mode) offer no effort
 # control — the frontend hides the selector and the backend drops the
 # value.
 EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
     "glm": ("low", "high", "max"),
     "kimi": ("low", "medium", "high", "max"),
+    # MiMo Token Plan: low/medium/high accepted, "max" -> HTTP 400 (2026-09-29).
+    "mimo": ("low", "medium", "high"),
+    "mimo-flash": ("low", "medium", "high"),
     "qwen": ("none", "low", "medium", "high"),
     "deepseek": ("none", "low", "medium", "high", "max"),
     "minimax": ("none", "low", "medium", "high"),

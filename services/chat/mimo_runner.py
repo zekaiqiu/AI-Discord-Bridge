@@ -2,13 +2,16 @@
 
 Thin wrapper over ``haihub_runner`` (same pattern as ``tokenhub_runner`` /
 ``local_runner``) that points at Xiaomi's MiMo OpenAI-compatible endpoint.
-Serves the ``mimo`` picker alias (MiMo V2.6 Pro, third option in the lineup
+Serves the ``mimo`` / ``mimo-flash`` picker aliases (MiMo V2.6 Pro / Flash, in the lineup
 since 2026-09-28). Same normalized event contract, same agent / tool loop,
 same ``_ThinkStripper`` for reasoning models.
 
 Provider facts (probed 2026-09-28):
-  * Xiaomi direct: base ``https://api.xiaomimimo.com/v1``, model id
-    ``mimo-v2.6-pro``, keys at platform.xiaomimimo.com/console/api-keys.
+  * Xiaomi Token Plan (default since 2026-09-29): base
+    ``https://token-plan-sgp.xiaomimimo.com/v1``, model ids ``mimo-v2.6-pro`` and
+    ``mimo-v2.6-flash``; key in ``~/.mimo_key``. Accepts reasoning_effort
+    low/medium/high (max and anything else -> HTTP 400).
+  * Xiaomi pay-as-you-go: ``https://api.xiaomimimo.com/v1`` (different key).
   * haihub does NOT serve it (404 on every MiMo id).
   * Tencent TokenHub's Token Plan key (``~/.glm_key``) is NOT scoped for it
     (403002 "not authorized to access model mimo-v2.6-pro"); TokenHub's
@@ -36,7 +39,7 @@ import haihub_runner
 import tokenhub_runner
 
 MIMO_BASE_URL = os.environ.get(
-    "MIMO_BASE_URL", "https://api.xiaomimimo.com/v1"
+    "MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"
 ).rstrip("/")
 
 # Resolved per call (see module docstring) — NOT at import time.
@@ -47,14 +50,15 @@ _MIMO_KEY_FILE = Path(os.environ.get(
 # Frontend alias -> MiMo model id (exact, case-sensitive).
 _MIMO_MODELS: dict[str, str] = {
     "mimo": "mimo-v2.6-pro",
+    "mimo-flash": "mimo-v2.6-flash",
 }
 
-# MiMo V2.6 Pro advertises up to 128K output tokens; same ceiling as the
+# MiMo V2.6 advertises up to 128K output tokens; same ceiling as the
 # TokenHub models — a cap, not a target (see tokenhub_runner).
 _MIMO_MAX_TOKENS = 65536
 
 NOT_CONFIGURED_MESSAGE = (
-    "MiMo V2.6 Pro is not configured yet: no MIMO_API_KEY / ~/.mimo_key and no "
+    "MiMo V2.6 is not configured yet: no MIMO_API_KEY / ~/.mimo_key and no "
     "TokenHub key on the host. Pick another model or ask the operator to add a key."
 )
 

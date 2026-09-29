@@ -198,6 +198,8 @@ function saveWorkspacePref(value: Workspace): void {
 const SERVED_MODELS: ModelChoice[] = [
   "glm",
   "kimi",
+  "mimo",
+  "mimo-flash",
   "qwen",
   "deepseek",
   "minimax",

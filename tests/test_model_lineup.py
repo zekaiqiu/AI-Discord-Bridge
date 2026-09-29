@@ -1,8 +1,8 @@
 """Bridge model table (!model) — lineup invariants.
 
-MiMo V2.6 Pro (Xiaomi) was added as the third option on 2026-09-28 and parked
-the same day (no key with MiMo scope). Its provider entry ("mimo") stays wired
-so the row can be re-added without code changes; the lineup must not list it.
+MiMo V2.6 Pro (Xiaomi) was added on 2026-09-28 and parked the same day (no key
+with MiMo scope). Re-added 2026-09-29 with MiMo V2.6 Flash, both on the Xiaomi
+Token Plan endpoint.
 """
 from __future__ import annotations
 
@@ -12,19 +12,26 @@ import bot
 import bridge_account_router
 
 
-def test_mimo_is_parked_but_provider_stays_wired():
+def test_mimo_pro_and_flash_follow_tokenhub_models():
     ids = [m["id"] for m in bot.AVAILABLE_MODELS]
-    assert ids[:2] == ["kimi-k3", "glm-5.3"]
-    assert "mimo-v2.6-pro" not in ids
-    assert bot._model_by_id("mimo-v2.6-pro") is None
-    assert "mimo" in bot._OPENAI_PROVIDERS
+    assert ids[:4] == ["kimi-k3", "glm-5.3", "mimo-v2.6-pro", "mimo-v2.6-flash"]
+    for mid in ("mimo-v2.6-pro", "mimo-v2.6-flash"):
+        m = bot._model_by_id(mid)
+        assert m["provider"] == "mimo" and m["api_model"] == mid
+        assert m["effort"] == ["low", "medium", "high"]  # "max" -> HTTP 400
 
 
-def test_persisted_mimo_choice_falls_back_to_default(monkeypatch, tmp_path):
+def test_persisted_mimo_choice_is_kept(monkeypatch, tmp_path):
     f = tmp_path / "model"
-    f.write_text("mimo-v2.6-pro", encoding="utf-8")
+    f.write_text("mimo-v2.6-flash", encoding="utf-8")
     monkeypatch.setattr(bot, "BRIDGE_MODEL_FILE", f)
-    assert bot.current_model()["id"] in ids_of(bot.AVAILABLE_MODELS)
+    assert bot.current_model()["id"] == "mimo-v2.6-flash"
+
+
+def test_mimo_default_base_url_is_token_plan():
+    import os
+    if not os.environ.get("MIMO_BASE_URL"):
+        assert bot._MIMO_BASE_URL == "https://token-plan-sgp.xiaomimimo.com/v1"
 
 
 def ids_of(models):

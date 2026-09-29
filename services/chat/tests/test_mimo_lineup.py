@@ -1,8 +1,9 @@
-"""MiMo V2.6 Pro (Xiaomi) — third picker option since 2026-09-28.
+"""MiMo V2.6 Pro / Flash (Xiaomi Token Plan) — served since 2026-09-29.
 
-Covers: the alias is a served non-claude model (normalize, storage, identity),
-dispatch reaches mimo_runner (fake, no network), and the runner fails closed
-with a clear message while no key is configured (instead of a blank reply).
+Covers: both aliases are served non-claude models (normalize, storage,
+identity, effort), dispatch reaches mimo_runner (fake, no network), the
+runner defaults to the Token Plan endpoint, and it fails closed with a clear
+message when no key is configured (instead of a blank reply).
 """
 from __future__ import annotations
 
@@ -31,49 +32,63 @@ def _install_fake_mimo(monkeypatch: Any) -> dict[str, Any]:
     return captured
 
 
-def test_mimo_is_parked_not_served(monkeypatch):
-    # Parked 2026-09-28: the runner module stays, the alias is out of the
-    # lineup, so a stale "mimo" from a saved thread/blob lands on the default.
+MIMO_ALIASES = {"mimo": "mimo-v2.6-pro", "mimo-flash": "mimo-v2.6-flash"}
+
+
+def test_mimo_aliases_are_served(monkeypatch):
     monkeypatch.setattr(app_module, "CHAT_DEFAULT_MODEL", "glm")
-    assert app_module._normalize_model("mimo") == "glm"
-    assert "mimo" not in app_module.NON_CLAUDE_MODELS
-    assert "mimo" not in storage._VALID_MODELS
-    assert mimo_runner.is_mimo_model("mimo")
+    for alias, model_id in MIMO_ALIASES.items():
+        assert app_module._normalize_model(alias) == alias
+        assert alias in app_module.NON_CLAUDE_MODELS
+        assert alias in storage._VALID_MODELS
+        assert mimo_runner.is_mimo_model(alias)
+        assert mimo_runner._MIMO_MODELS[alias] == model_id
+        _, ident_id, vendor = prompt_blocks.MODEL_IDENTITY[alias]
+        assert ident_id == model_id and vendor == "Xiaomi"
     assert not mimo_runner.is_mimo_model("glm")
-    assert mimo_runner._MIMO_MODELS["mimo"] == "mimo-v2.6-pro"
-    name, model_id, vendor = prompt_blocks.MODEL_IDENTITY["mimo"]
-    assert model_id == "mimo-v2.6-pro" and vendor == "Xiaomi"
 
 
-def test_mimo_has_no_effort_levels_until_probed():
-    # No key on the host yet → levels unverified → effort must never be sent.
-    assert app_module._validated_effort("mimo", "high") is None
-    assert "mimo" not in app_module.EFFORT_LEVELS
+def test_mimo_default_base_url_is_token_plan():
+    import importlib, os
+    if os.environ.get("MIMO_BASE_URL"):
+        return  # an explicit override wins; nothing to assert about the default
+    importlib.reload(mimo_runner)
+    assert mimo_runner.MIMO_BASE_URL == "https://token-plan-sgp.xiaomimimo.com/v1"
 
 
-def test_settings_migrate_mimo_default_to_glm():
-    coerced = storage._coerce_settings({"default_model": "mimo"})
-    assert coerced["default_model"] == "glm"
+def test_mimo_effort_levels_match_gateway():
+    # Probed 2026-09-29: low/medium/high accepted, "max" -> HTTP 400.
+    for alias in MIMO_ALIASES:
+        assert app_module.EFFORT_LEVELS[alias] == ("low", "medium", "high")
+        assert app_module._validated_effort(alias, "high") == "high"
+        assert app_module._validated_effort(alias, "max") is None
+
+
+def test_settings_accept_mimo_defaults():
+    for alias in MIMO_ALIASES:
+        assert storage._coerce_settings({"default_model": alias})["default_model"] == alias
     # unknown values still fall back to the default model
     assert storage._coerce_settings({"default_model": "nope"})["default_model"] == "glm"
 
 
-def test_dispatch_never_reaches_mimo_runner_while_parked(
+def test_dispatch_reaches_mimo_runner(
     client, auth_headers, fake_claude, monkeypatch, drain_background_tasks
 ):
     monkeypatch.setattr(app_module, "CHAT_DEFAULT_MODEL", "glm")
     captured = _install_fake_mimo(monkeypatch)
     headers = auth_headers(USER_A)
-    sid = create_session(client, headers)
-    resp = client.post(
-        f"/api/sessions/{sid}/messages",
-        headers=headers,
-        json={"text": "ping", "model": "mimo", "effort": "high"},
-    )
-    assert resp.status_code == 200
-    events = consume_sse(resp)
-    assert [e.get("event") for e in events].count("done") == 1
-    assert captured["calls"] == [], "parked model must not be dispatched"
+    for alias in MIMO_ALIASES:
+        sid = create_session(client, headers)
+        resp = client.post(
+            f"/api/sessions/{sid}/messages",
+            headers=headers,
+            json={"text": "ping", "model": alias, "effort": "high"},
+        )
+        assert resp.status_code == 200
+        events = consume_sse(resp)
+        assert [e.get("event") for e in events].count("done") == 1
+    assert [c.get("model") for c in captured["calls"]] == list(MIMO_ALIASES)
+    assert all(c.get("effort") == "high" for c in captured["calls"])
 
 
 def test_runner_fails_closed_without_key(monkeypatch, tmp_path):

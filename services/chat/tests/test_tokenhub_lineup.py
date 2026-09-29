@@ -102,6 +102,7 @@ def test_effort_levels_match_runner_lineups():
         assert (
             tokenhub_runner.is_tokenhub_model(alias)
             or app_module.haihub_runner.is_haihub_model(alias)
+            or app_module.mimo_runner.is_mimo_model(alias)
         ), alias
 
 

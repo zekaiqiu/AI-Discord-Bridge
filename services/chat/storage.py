@@ -204,7 +204,7 @@ def _session_path(email: str, session_id: str) -> str:
 SETTINGS_FILENAME = "_settings.json"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "default_model": "glm",           # glm | kimi | qwen | deepseek | minimax | gemma4-local
+    "default_model": "glm",           # glm | kimi | mimo | mimo-flash | qwen | deepseek | minimax | gemma4-local
     "send_on_enter": True,            # if False, Enter inserts newline; Cmd/Ctrl+Enter sends
     "persona": "",                    # personal system-prompt prefix, prepended to every turn
     "notify_on_complete": False,      # browser desktop notification when a turn ends
@@ -226,9 +226,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 # were removed from chat.wizerith.ai. Saved blobs still carrying an old
 # value (opus5 / default / ...) fail this membership test on the next read
 # and fall back to DEFAULT_SETTINGS — a free migration to glm.
-# "mimo" parked 2026-09-28 (see app.NON_CLAUDE_MODELS): a saved MiMo default
-# fails membership and migrates to glm.
-_VALID_MODELS = {"glm", "kimi", "qwen", "deepseek", "minimax", "gemma4-local"}
+_VALID_MODELS = {
+    "glm", "kimi", "mimo", "mimo-flash", "qwen", "deepseek", "minimax", "gemma4-local",
+}
 _VALID_THEMES = {"dark", "light", "system"}
 # Site-wide display language is English + Simplified/Traditional Chinese only.
 # Legacy "de"/"tl" values no longer validate, so any saved blob carrying them

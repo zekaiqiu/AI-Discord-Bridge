@@ -60,6 +60,8 @@ export type ModelChoice =
   | "default"
   | "glm"
   | "kimi"
+  | "mimo"
+  | "mimo-flash"
   | "qwen"
   | "deepseek"
   | "minimax"
@@ -69,6 +71,8 @@ export const MODEL_LABELS: Record<ModelChoice, string> = {
   default: "Auto",
   glm: "GLM-5.3",
   kimi: "Kimi K3",
+  mimo: "MiMo V2.6 Pro",
+  "mimo-flash": "MiMo V2.6 Flash",
   qwen: "Qwen3.5 397B",
   deepseek: "DeepSeek V4",
   minimax: "MiniMax M2.7",
@@ -82,6 +86,8 @@ export const MODEL_LABELS: Record<ModelChoice, string> = {
 export const EFFORT_LEVELS: Partial<Record<ModelChoice, string[]>> = {
   glm: ["low", "high", "max"],
   kimi: ["low", "medium", "high", "max"],
+  mimo: ["low", "medium", "high"],
+  "mimo-flash": ["low", "medium", "high"],
   qwen: ["none", "low", "medium", "high"],
   deepseek: ["none", "low", "medium", "high", "max"],
   minimax: ["none", "low", "medium", "high"],

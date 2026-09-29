@@ -373,16 +373,17 @@ def should_ping_now(record: dict, now: float) -> bool:
 # BRIDGE_MODEL_FILE and shown in `!model`.
 # provider="tokenhub" → same host-tool loop against Tencent TokenHub's
 # OpenAI-compatible Token Plan endpoint (api_model is the TokenHub model id).
-# provider="mimo" → same loop against Xiaomi's MiMo OpenAI-compatible API
-# (MIMO_BASE_URL; key from MIMO_API_KEY or ~/.mimo_key).
+# provider="mimo" → same loop against Xiaomi's MiMo Token Plan API
+# (MIMO_BASE_URL, default token-plan-sgp; key from MIMO_API_KEY or ~/.mimo_key).
 AVAILABLE_MODELS: list[dict] = [
     {"label": "Kimi K3",           "provider": "tokenhub",  "id": "kimi-k3",  "api_model": "kimi-k3",
      "effort": ["low", "medium", "high", "max"]},
     {"label": "GLM-5.3",           "provider": "tokenhub",  "id": "glm-5.3",  "api_model": "glm-5.3",
      "effort": ["low", "high", "max"]},
-    # MiMo V2.6 Pro (provider "mimo", id "mimo-v2.6-pro") parked 2026-09-28:
-    # the provider entry below stays wired, re-add the row once a key with
-    # MiMo scope exists.
+    {"label": "MiMo V2.6 Pro",     "provider": "mimo",      "id": "mimo-v2.6-pro",   "api_model": "mimo-v2.6-pro",
+     "effort": ["low", "medium", "high"]},
+    {"label": "MiMo V2.6 Flash",   "provider": "mimo",      "id": "mimo-v2.6-flash", "api_model": "mimo-v2.6-flash",
+     "effort": ["low", "medium", "high"]},
     {"label": "Fable 5.1",         "provider": "anthropic", "id": "claude-fable-5-1",          "betas": None,
      "effort": ["low", "medium", "high", "xhigh", "max"]},
     {"label": "Opus 5.5",          "provider": "anthropic", "id": "claude-opus-5-5",           "betas": None,
@@ -510,7 +511,7 @@ _TOKENHUB_KEY_FILE = Path(os.environ.get(
 
 
 _MIMO_BASE_URL = os.environ.get(
-    "MIMO_BASE_URL", "https://api.xiaomimimo.com/v1"
+    "MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"
 ).rstrip("/")
 _MIMO_KEY_FILE = Path(os.environ.get(
     "MIMO_KEY_FILE", str(Path.home() / ".mimo_key")
@@ -571,7 +572,7 @@ _OPENAI_PROVIDERS: dict[str, dict] = {
         # base_url is a callable: it depends on which key resolves this turn.
         "base_url": lambda: _resolve_mimo_endpoint()[0],
         "key": lambda: _resolve_mimo_endpoint()[1],
-        "missing": "no MiMo key (MIMO_API_KEY or ~/.mimo_key) and no TokenHub key — MiMo V2.6 Pro is not configured yet",
+        "missing": "no MiMo key (MIMO_API_KEY or ~/.mimo_key) and no TokenHub key — MiMo V2.6 is not configured yet",
     },
 }
 _QWEN_MAX_TOKENS = 8192
