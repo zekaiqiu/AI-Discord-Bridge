@@ -42,6 +42,7 @@ import httpx
 from concurrent.futures import ThreadPoolExecutor
 
 import prompt_blocks
+import token_ledger
 
 logger = logging.getLogger("chat.haihub_runner")
 
@@ -581,7 +582,51 @@ async def _exec_bash(
     return out if out.strip() else f"(exit code {code}, no output)"
 
 
+def provider_of(base_url: str) -> str:
+    """Short provider tag for the token ledger, from the endpoint URL."""
+    u = (base_url or "").lower()
+    for needle, tag in (("tokenhub", "tokenhub"), ("xiaomimimo", "mimo"),
+                        ("haihub", "haihub"), ("localhost", "local"),
+                        ("host.docker.internal", "local")):
+        if needle in u:
+            return tag
+    return u.split("//", 1)[-1].split("/", 1)[0] or "openai-compatible"
+
+
 async def _stream_step(
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+    *,
+    base_url: str,
+    api_key: str,
+) -> AsyncIterator[dict[str, Any]]:
+    """``_stream_step_raw`` plus a token-ledger row for the call. The row is
+    written as the terminal sentinel passes (before it is yielded, so a
+    consumer that stops right after it still gets it recorded), or from the
+    ``finally`` when the stream is cancelled or closed early."""
+    timer = token_ledger.OpenAICallTimer(provider_of(base_url), payload)
+    try:
+        async for ev in _stream_step_raw(client, payload, base_url=base_url, api_key=api_key):
+            t = ev["type"]
+            if t == "delta":
+                timer.first_token()
+                timer.out_chars += len(ev.get("text") or "")
+            elif t == "reasoning":
+                timer.first_token()
+                timer.reasoning_chars += len(ev.get("text") or "")
+            elif t == "_meta":
+                timer.usage = ev.get("usage")
+                timer.finish_reason = ev.get("finish_reason")
+                timer.tool_calls = len(ev.get("tool_calls") or [])
+                timer.finish("repetition" if ev.get("degenerate") else "ok")
+            elif t == "_error":
+                timer.finish("error", ev.get("message"))
+            yield ev
+    finally:
+        timer.finish("cancelled")
+
+
+async def _stream_step_raw(
     client: httpx.AsyncClient, payload: dict[str, Any],
     *, base_url: str = HAIHUB_BASE_URL, api_key: str = HAIHUB_API_KEY,
 ) -> AsyncIterator[dict[str, Any]]:

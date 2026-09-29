@@ -170,8 +170,8 @@ RUN pip install --no-cache-dir -r /app/requirements-user.txt
 # ``static/`` from the host; we list explicit roots so neither sneaks in.
 # Tests and conftest.py are excluded via .dockerignore (run on host, not in
 # the production image).
-COPY app.py auth.py local_auth.py local_auth_routes.py storage.py attachments.py artifact_runner.py claude_runner.py session_process.py haihub_runner.py local_runner.py tokenhub_runner.py prompt_blocks.py image_gen.py markers.py account_router.py user_container.py user_container_eviction.py run_turn.py sessions.py anthropic_auth_proxy.py chat_scheduler.py /app/
-COPY app.py auth.py local_auth.py local_auth_routes.py storage.py attachments.py artifact_runner.py claude_runner.py session_process.py haihub_runner.py local_runner.py mimo_runner.py prompt_blocks.py image_gen.py markers.py account_router.py user_container.py user_container_eviction.py run_turn.py sessions.py anthropic_auth_proxy.py chat_scheduler.py /app/
+COPY app.py auth.py local_auth.py local_auth_routes.py storage.py attachments.py artifact_runner.py claude_runner.py session_process.py haihub_runner.py local_runner.py tokenhub_runner.py prompt_blocks.py image_gen.py markers.py account_router.py user_container.py user_container_eviction.py run_turn.py sessions.py anthropic_auth_proxy.py chat_scheduler.py token_ledger.py /app/
+COPY app.py auth.py local_auth.py local_auth_routes.py storage.py attachments.py artifact_runner.py claude_runner.py session_process.py haihub_runner.py local_runner.py mimo_runner.py prompt_blocks.py image_gen.py markers.py account_router.py user_container.py user_container_eviction.py run_turn.py sessions.py anthropic_auth_proxy.py chat_scheduler.py token_ledger.py /app/
 
 # Quant-research CLIs — research-time tools the chat-driven model invokes
 # from inside per-user containers (which reuse this image). Both target

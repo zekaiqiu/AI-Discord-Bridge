@@ -35,9 +35,13 @@ class ModelRates:
 #   - claude-opus-5-5      :  4.00 / 20.00 / 0.20 /  5.00  (platform.claude.com models
 #     overview, 2026-09-23: cache read is 5% of input on Opus 5.5; cache write
 #     assumed at the standard 1.25x input)
-#   - claude-opus-4-7      : 15.00 / 75.00 / 1.50 / 18.75
+#   - claude-opus-4-7      :  5.00 / 25.00 / 0.50 /  6.25
+#   - claude-fable-5-1     : 10.00 / 50.00 / 0.25 / 12.50
+#   - claude-sonnet-5      :  2.00 / 10.00 / 0.20 /  2.50
+#     (2026-09-29: Opus 4.7 / Haiku 4.5 corrected; Fable 5.1, Sonnet 5, Opus 5.5
+#     and Haiku 4.5 verified against the claude CLI's total_cost_usd)
 #   - claude-sonnet-4-6    :  3.00 / 15.00 / 0.30 /  3.75
-#   - claude-haiku-4-5-... :  0.80 /  4.00 / 0.08 /  1.00
+#   - claude-haiku-4-5-... :  1.00 /  5.00 / 0.10 /  1.25
 # When updating, also bump the date stamp above.
 MODEL_PRICING: Dict[str, ModelRates] = {
     "claude-opus-5-5": ModelRates(
@@ -53,10 +57,22 @@ MODEL_PRICING: Dict[str, ModelRates] = {
         cache_write_per_mtok=6.25,
     ),
     "claude-opus-4-7": ModelRates(
-        input_per_mtok=15.00,
-        output_per_mtok=75.00,
-        cache_read_per_mtok=1.50,
-        cache_write_per_mtok=18.75,
+        input_per_mtok=5.00,
+        output_per_mtok=25.00,
+        cache_read_per_mtok=0.50,
+        cache_write_per_mtok=6.25,
+    ),
+    "claude-fable-5-1": ModelRates(
+        input_per_mtok=10.00,
+        output_per_mtok=50.00,
+        cache_read_per_mtok=0.25,
+        cache_write_per_mtok=12.50,
+    ),
+    "claude-sonnet-5": ModelRates(
+        input_per_mtok=2.00,
+        output_per_mtok=10.00,
+        cache_read_per_mtok=0.20,
+        cache_write_per_mtok=2.50,
     ),
     "claude-sonnet-4-6": ModelRates(
         input_per_mtok=3.00,
@@ -65,10 +81,10 @@ MODEL_PRICING: Dict[str, ModelRates] = {
         cache_write_per_mtok=3.75,
     ),
     "claude-haiku-4-5-20251001": ModelRates(
-        input_per_mtok=0.80,
-        output_per_mtok=4.00,
-        cache_read_per_mtok=0.08,
-        cache_write_per_mtok=1.00,
+        input_per_mtok=1.00,
+        output_per_mtok=5.00,
+        cache_read_per_mtok=0.10,
+        cache_write_per_mtok=1.25,
     ),
 }
 

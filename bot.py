@@ -37,6 +37,25 @@ import help_registry  # noqa: E402  -- Phase 1-5 doc registry
 import help_registry  # noqa: E402  -- Phase 1-5 doc registry
 import phase15_dispatch  # noqa: E402  -- Dispatcher + register_phase{1,5}_commands
 import bridge_account_router  # noqa: E402  -- multi-account HOME routing
+import token_report  # noqa: E402  -- !tokens reports + token alert checks
+
+
+def _load_token_ledger():
+    """services/chat/token_ledger.py, loaded by path: putting services/chat on
+    sys.path would let its modules shadow the bridge's own (tasks, ...)."""
+    import importlib.util
+    import sys as _sys
+    if "token_ledger" in _sys.modules:
+        return _sys.modules["token_ledger"]
+    spec = importlib.util.spec_from_file_location(
+        "token_ledger", Path(__file__).resolve().parent / "services" / "chat" / "token_ledger.py")
+    mod = importlib.util.module_from_spec(spec)
+    _sys.modules["token_ledger"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+token_ledger = _load_token_ledger()  # noqa: E402  -- per-call token/cost ledger
 
 load_dotenv()
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
@@ -795,12 +814,30 @@ async def _qwen_stream_step(
     stripper = _ThinkStripper()
     url = f"{base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    timer = token_ledger.OpenAICallTimer(provider, payload)
+    try:
+        return await _qwen_stream_step_body(
+            client, url, headers, payload, sink, text_parts, timer,
+            provider=provider, reasoning_parts=reasoning_parts,
+            content_parts=content_parts, tool_acc=tool_acc, stripper=stripper,
+        )
+    finally:
+        # Cancelled (!stop) or crashed mid-stream: still record the call.
+        timer.finish("cancelled")
+
+
+async def _qwen_stream_step_body(
+    client, url, headers, payload, sink, text_parts, timer, *, provider,
+    reasoning_parts, content_parts, tool_acc, stripper,
+) -> tuple[list[dict], str, str | None]:
     try:
         async with client.stream("POST", url, headers=headers, json=payload) as resp:
             if resp.status_code != 200:
                 body = (await resp.aread()).decode("utf-8", "replace")[:300]
                 log.warning("%s HTTP %s: %s", provider, resp.status_code, body)
-                return [], "", f"{provider} HTTP {resp.status_code}: {body[:200]}"
+                err = f"{provider} HTTP {resp.status_code}: {body[:200]}"
+                timer.finish("error", err)
+                return [], "", err
             async for line in resp.aiter_lines():
                 if not line or not line.startswith("data:"):
                     continue
@@ -811,17 +848,29 @@ async def _qwen_stream_step(
                     obj = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(obj, dict):
+                    continue
+                # Usage rides on the final chunk, usually with empty choices.
+                if isinstance(obj.get("usage"), dict):
+                    timer.usage = obj["usage"]
                 choices = obj.get("choices") or []
                 if not choices:
                     continue
+                if choices[0].get("finish_reason"):
+                    timer.finish_reason = str(choices[0]["finish_reason"])
                 delta = choices[0].get("delta") or {}
                 rtext = delta.get("reasoning_content")
+                if rtext:
+                    timer.first_token()
+                    timer.reasoning_chars += len(rtext)
                 if rtext and reasoning_parts is not None:
                     reasoning_parts.append(rtext)
                 if rtext and sink is not None:
                     await sink.feed("thinking", rtext)
                 ctext = delta.get("content")
                 if ctext:
+                    timer.first_token()
+                    timer.out_chars += len(ctext)
                     # Strip any inline <think>…</think> reasoning (MiniMax etc.)
                     # so it doesn't leak into the visible answer.
                     clean = stripper.feed(ctext)
@@ -842,7 +891,9 @@ async def _qwen_stream_step(
                         slot["args"] += fn["arguments"]
     except Exception as exc:  # noqa: BLE001
         log.exception("%s stream failed", provider)
-        return [], "", f"{provider} request failed: {type(exc).__name__}"
+        err = f"{provider} request failed: {type(exc).__name__}"
+        timer.finish("error", err)
+        return [], "", err
     tail = stripper.flush()
     if tail:
         content_parts.append(tail)
@@ -850,6 +901,8 @@ async def _qwen_stream_step(
         if sink is not None:
             await sink.feed("text", tail)
     tool_calls = [tool_acc[i] for i in sorted(tool_acc)]
+    timer.tool_calls = len(tool_calls)
+    timer.finish("ok")
     return tool_calls, "".join(content_parts), None
 
 
@@ -902,6 +955,8 @@ async def _run_haihub(
                     "messages": messages,
                     "tools": _QWEN_TOOLS,
                     "tool_choice": "auto",
+                    # Final chunk carries token usage (the token ledger).
+                    "stream_options": {"include_usage": True},
                 }
                 if effort:
                     payload["reasoning_effort"] = effort
@@ -983,7 +1038,36 @@ async def _run_haihub(
     return aggregate, route
 
 
-async def run_claude(
+async def run_claude(*args, **kwargs) -> tuple[str, "bridge_account_router.RouteDecision"]:
+    """``_run_claude`` inside a token-ledger turn: every model call it makes
+    (claude CLI messages, GLM/Kimi/MiMo/haihub steps) lands in the ledger
+    under one bridge turn row."""
+    model = current_model()
+    turn = token_ledger.begin_turn(
+        app="bridge", user=f"discord:{ALLOWED_USER_ID}",
+        session=getattr(client, "_claude_session_id", None),
+        turn_id=f"bridge:{uuid.uuid4().hex[:16]}",
+        provider=model.get("provider"), model=model.get("api_model") or model.get("id"),
+        effort=current_effort(model),
+        prompt_chars=len(args[0]) if args and isinstance(args[0], str) else None,
+    )
+    status = "cancelled"
+    try:
+        out = await _run_claude(*args, **kwargs)
+        status = "ok"
+        return out
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        if turn.session is None:
+            turn.session = getattr(client, "_claude_session_id", None)
+        token_ledger.end_turn(status, turn)
+
+
+async def _run_claude(
     prompt: str,
     continue_session: bool = True,
     attachments_dir: Path | None = None,
@@ -1138,6 +1222,11 @@ async def run_claude(
             effort=current_effort(_model_by_id("qwen")),
         )
 
+    _lt = token_ledger.current()
+    if _lt is not None:
+        _lt.account = route.name
+        token_ledger._upsert_turn(_lt, status="running")
+
     # Pick session arg. The bridge writes session jsonls into
     # ~/.claude/projects/-home-felix/ — the same dir the chat backend's admin
     # sessions use (services/chat shells `claude` via the host-shell sidecar
@@ -1221,6 +1310,8 @@ async def run_claude(
         text_parts: list[str] = []
         final_result: str | None = None
         stderr_buf: list[bytes] = []
+        # One token-ledger row per API message the CLI makes this turn.
+        tracker = token_ledger.ClaudeStreamTracker()
 
         async def consume_stderr() -> None:
             # stream-json puts protocol on stdout; stderr now carries CLI
@@ -1250,6 +1341,7 @@ async def run_claude(
                         "stream-json: skipping non-JSON line: %r", line[:200]
                     )
                     continue
+                tracker.feed(event)
                 etype = event.get("type")
                 if etype == "stream_event":
                     inner = event.get("event") or {}
@@ -1309,6 +1401,8 @@ async def run_claude(
                     "The bridge is unblocked — try again."
                 )
         finally:
+            tracker.flush("ok" if proc.returncode == 0 else "error",
+                          model_hint=model.get("id"))
             if _inline_claude_proc is proc:
                 globals()["_inline_claude_proc"] = None
 
@@ -3108,6 +3202,19 @@ async def run_wakeup_turn(channel, prompt: str) -> None:
         shutil.rmtree(artifacts_dir, ignore_errors=True)
 
 
+@tasks.loop(seconds=120)
+async def token_alert_loop() -> None:
+    """DM the operator when a turn or a day's token spend crosses a threshold
+    (token_report.check_alerts; each alert fires once)."""
+    try:
+        alerts = await asyncio.to_thread(token_report.check_alerts)
+    except Exception:  # noqa: BLE001
+        log.exception("token alert check failed")
+        return
+    for text in alerts:
+        await dm_user(text)
+
+
 @tasks.loop(seconds=20)
 async def wakeup_loop() -> None:
     """Fire any due self-wakeups (wakeups.py sidecar files) into the last
@@ -3435,6 +3542,21 @@ def _register_all_commands() -> None:
         handler=lambda m, a: _handle_stop(m, a),
     ))
     R(C(
+        name="!tokens",
+        section="CONVERSATION",
+        one_liner="token spend on the bridge + chat.wizerith.ai (per call / turn / user / model)",
+        docs=(
+            "`!tokens [window]` — totals by app, model, user and purpose (window: "
+            "1h, 24h, 7d, 30d, today, all; default 24h).\n"
+            "`!tokens top [window] [n]` — largest turns.\n"
+            "`!tokens turn <id>` — every model call of one turn.\n"
+            "`!tokens calls [window] [n]` — most recent calls.\n"
+            "`!tokens hourly [window]` / `users` / `errors` / `running`.\n"
+            "Alerts DM you when a turn or a day crosses its threshold."
+        ),
+        handler=lambda m, a: handle_tokens(m, a),
+    ))
+    R(C(
         name="!model",
         section="CONVERSATION",
         one_liner="show / list / set the bridge model (Anthropic path)",
@@ -3694,6 +3816,25 @@ async def handle_help(msg: discord.Message, args: str) -> None:
     await msg.channel.send(out)
 
 
+async def handle_tokens(msg: discord.Message, args: str) -> None:
+    """!tokens — reports over the shared token ledger (token_report)."""
+    try:
+        text = await asyncio.to_thread(token_report.render, (args or "").split())
+    except Exception as exc:  # noqa: BLE001
+        log.exception("!tokens failed")
+        await msg.channel.send(f"_!tokens failed: {type(exc).__name__}: {exc}_")
+        return
+    if len(text) <= 1900:
+        await msg.channel.send(f"```\n{text}\n```")
+        return
+    # Wide tables: first block inline, full report as a file.
+    head = text[:1800].rsplit("\n", 1)[0]
+    await msg.channel.send(
+        f"```\n{head}\n```",
+        file=discord.File(io.BytesIO(text.encode("utf-8")), filename="tokens.txt"),
+    )
+
+
 async def handle_model(msg: discord.Message, args: str) -> None:
     a = args.strip()
     cur = current_model()
@@ -3914,6 +4055,9 @@ async def on_ready() -> None:
     if not wakeup_loop.is_running():
         wakeup_loop.start()
     log.info("wakeup loop registered (20s tick, self-wakeup sidecar firing)")
+    if not token_alert_loop.is_running():
+        token_alert_loop.start()
+    log.info("token alert loop registered (120s tick)")
 
 
 @client.event

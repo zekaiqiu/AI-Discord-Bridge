@@ -532,6 +532,19 @@ def write_fake_credentials(home: Path, name: str) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def hermetic_token_ledger(tmp_path_factory: pytest.TempPathFactory,
+                          monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Point the token ledger at a per-test tmp DB so the suite never writes
+    rows into the real /home/felix/.local/state/token-ledger/ledger.db."""
+    import token_ledger
+    d = tmp_path_factory.mktemp("ledger")
+    monkeypatch.setenv("TOKEN_LEDGER_DB", str(d / "ledger.db"))
+    monkeypatch.setenv("TOKEN_LEDGER_PRICES", str(d / "prices.json"))
+    token_ledger._current.set(None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def no_network(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
     """Make every outbound HTTP call from the service modules fail loudly.
 

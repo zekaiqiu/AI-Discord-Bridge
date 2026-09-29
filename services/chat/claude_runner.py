@@ -45,6 +45,7 @@ from typing import Any, AsyncIterator
 import docker
 
 import prompt_blocks
+import token_ledger
 import user_container
 
 
@@ -1372,6 +1373,22 @@ def _build_run_args(
     return args
 
 
+async def _tracked_frames(
+    frames: AsyncIterator[dict[str, Any]],
+    tracker: "token_ledger.ClaudeStreamTracker",
+) -> AsyncIterator[dict[str, Any]]:
+    """Pass frames through, feeding each to the token-ledger tracker; flush
+    it (idempotent) however the stream ends."""
+    status = "cancelled"
+    try:
+        async for obj in frames:
+            tracker.feed(obj)
+            yield obj
+        status = "ok"
+    finally:
+        tracker.flush(status)
+
+
 async def normalize_session_turn(
     turn: AsyncIterator[dict[str, Any]],
     *,
@@ -1391,7 +1408,8 @@ async def normalize_session_turn(
     usage: dict[str, int | None] | None = None
     turn_start = time.monotonic()
     saw_result = False
-    async for obj in turn:
+    tracker = token_ledger.ClaudeStreamTracker()
+    async for obj in _tracked_frames(turn, tracker):
         reasoning = _extract_reasoning_text(obj)
         if reasoning:
             yield {"type": "reasoning", "text": reasoning}
@@ -1416,6 +1434,7 @@ async def normalize_session_turn(
         if obj.get("type") == "result":
             saw_result = True
             # ``result`` is the turn's final event; the Turn closes right after.
+    tracker.flush("ok" if saw_result else "error", model_hint=model)
 
     if not saw_result:
         yield {
@@ -1911,6 +1930,7 @@ async def run_turn(
     # dispatch paths); we leave this None and emit null tokens in that case.
     usage: dict[str, int | None] | None = None
     turn_start = time.monotonic()
+    tracker = token_ledger.ClaudeStreamTracker()
 
     async def _stream_attempt(
         attempt_args: list[str], *, allow_heal: bool,
@@ -1969,6 +1989,7 @@ async def run_turn(
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     yield {"type": "error", "message": f"malformed stream-json: {exc}"}
                     return
+                tracker.feed(obj)
 
                 reasoning = _extract_reasoning_text(obj)
                 if reasoning:
@@ -2051,6 +2072,7 @@ async def run_turn(
                     _logger.exception("router success feedback failed")
             yield {"type": "done", "full_text": "".join(full_text_parts), "meta": meta}
         finally:
+            tracker.flush(model_hint=model)
             # Ensure the subprocess is reaped whether we exited cleanly, hit
             # an error, or were cancelled by the SSE consumer disconnecting.
             try:
@@ -2166,6 +2188,7 @@ async def generate_title(
     ]
     chunks: list[str] = []
     gen = spawn_claude(args)
+    tracker = token_ledger.ClaudeStreamTracker(purpose="title")
     try:
         async def _drain() -> None:
             async for line in gen:
@@ -2175,6 +2198,7 @@ async def generate_title(
                     obj = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
+                tracker.feed(obj)
                 t = _extract_delta_text(obj)
                 if t:
                     chunks.append(t)
@@ -2188,6 +2212,7 @@ async def generate_title(
             # caller's set_title no-op path takes over silently.
             return ""
     finally:
+        tracker.flush()
         try:
             await gen.aclose()
         except Exception:

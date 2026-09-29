@@ -55,6 +55,7 @@ import docker
 import haihub_runner
 import image_gen
 import local_runner
+import token_ledger
 import tokenhub_runner
 import mimo_runner
 import storage
@@ -2341,6 +2342,25 @@ async def _title_task(
 # across turns, so a backgrounded task auto-surfaces and the agent reports back
 # with no new user message. Verified live against a real per-user container.
 # ===========================================================================
+def _ledger_provider(model: str | None) -> str:
+    """Provider tag for the token ledger's turn row."""
+    if not _is_api_model(model):
+        return "anthropic"
+    if local_runner.is_local_model(model):
+        return "local"
+    if tokenhub_runner.is_tokenhub_model(model):
+        return "tokenhub"
+    if mimo_runner.is_mimo_model(model):
+        return "mimo"
+    return "haihub"
+
+
+def _ledger_status(run: "_TurnRun") -> str:
+    """Terminal status for the ledger: done -> ok, else the terminal type."""
+    t = (run.terminal or {}).get("type") if run is not None else None
+    return {"done": "ok"}.get(t or "", t or "interrupted")
+
+
 def _is_api_model(model: str | None) -> bool:
     """True for the OpenAI-compatible (stateless) runners: TokenHub glm/kimi,
     Xiaomi mimo, haihub qwen/deepseek/minimax, the home-GPU local model."""
@@ -2710,6 +2730,11 @@ async def _on_auto_turn(key: tuple[str, str], turn: Any) -> None:
     run = _TurnRun(email=email, session_id=session_id, assistant_seq=assistant_seq)
     _active_runs[key] = run
     full_text_parts: list[str] = []
+    ledger_turn = token_ledger.begin_turn(
+        app="chat", user=email, session=session_id,
+        turn_id=f"chat:{session_id}:{assistant_seq}:{int(time.time())}:auto",
+        provider="anthropic", model=session.get("model"),
+    )
     try:
         await _consume_into_run(
             run, gen, full_text_parts,
@@ -2745,6 +2770,7 @@ async def _on_auto_turn(key: tuple[str, str], turn: Any) -> None:
         except Exception:
             pass
     finally:
+        token_ledger.end_turn(_ledger_status(run), ledger_turn)
         # Identity-guarded: never pop a newer run that replaced ours.
         if _active_runs.get(key) is run:
             _active_runs.pop(key, None)
@@ -3210,6 +3236,14 @@ async def _run_turn_worker(
     # stale tab or a hand-crafted POST must never reach the provider.
     effort = _validated_effort(model, effort)
     turn_start_ts = time.time()
+    # Token ledger: every model call this task makes is recorded against
+    # this turn (see token_ledger); closed in the finally below.
+    ledger_turn = token_ledger.begin_turn(
+        app="chat", user=email, session=session_id,
+        turn_id=f"chat:{session_id}:{assistant_seq}:{int(turn_start_ts)}",
+        provider=_ledger_provider(model), model=model, effort=effort,
+        account=account, prompt_chars=len(user_text or ""),
+    )
 
     try:
         if _is_api_model(model):
@@ -3547,6 +3581,7 @@ async def _run_turn_worker(
                 await gen.aclose()
             except Exception:
                 pass
+        token_ledger.end_turn(_ledger_status(run), ledger_turn)
         # Purge the per-session attachments dir on every terminal so files
         # uploaded for THIS turn don't silently re-enter the model context on
         # the next turn. Keep them if we are dying with the process: the
