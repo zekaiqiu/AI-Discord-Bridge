@@ -96,6 +96,11 @@ const LAST_SESSION_KEY = "chat.lastSession";
 // side-by-side chat windows the user had open.
 const PANES_KEY = "chat.panes";
 const FOCUSED_PANE_KEY = "chat.focusedPane";
+// Per-window model picks: { [paneKey]: modelAlias }. Only models the user
+// chose in a window's picker are stored, so an untouched window keeps
+// following the Settings default. Without this a refresh reset every
+// window to the default.
+const PANE_MODELS_KEY = "chat.paneModels.v1";
 const MAX_PANES = 4;
 /** How often an idle, visible tab re-checks open sessions for turns it did
  *  not start — i.e. scheduled wakes. Deliberately coarse: the fetch is one
@@ -321,6 +326,33 @@ function savePanes(panes: Pane[], focused: string | null): void {
   }
 }
 
+function loadPaneModels(): Record<string, ModelChoice> {
+  const out: Record<string, ModelChoice> = {};
+  try {
+    const raw = localStorage.getItem(PANE_MODELS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (SERVED_MODELS.includes(v as ModelChoice)) out[k] = v as ModelChoice;
+      }
+    }
+  } catch {
+    /* corrupt / unavailable; fall through */
+  }
+  return out;
+}
+
+function savePaneModel(paneKey: string, model: ModelChoice | null): void {
+  try {
+    const cur = loadPaneModels();
+    if (model) cur[paneKey] = model;
+    else delete cur[paneKey];
+    localStorage.setItem(PANE_MODELS_KEY, JSON.stringify(cur));
+  } catch {
+    /* ignore */
+  }
+}
+
 // Per-window composer state that is NOT the draft text: model override and
 // the web-search / image-gen toggles and the queued attachments. Kept per
 // pane so toggling web-search (or attaching a file) in one window doesn't
@@ -392,7 +424,15 @@ export function App(): JSX.Element {
   const [focusedPaneKey, setFocusedPaneKey] = useState<string>(bootRef.current.focused);
   // Per-window composer ephemerals (model / web-search / image / queued
   // attachments), keyed by pane key. Absent entries fall back to defaults.
-  const [paneEphem, setPaneEphem] = useState<Map<string, PaneEphem>>(() => new Map());
+  // Model picks survive a refresh (loadPaneModels); the rest starts empty.
+  const [paneEphem, setPaneEphem] = useState<Map<string, PaneEphem>>(() => {
+    const picks = loadPaneModels();
+    const m = new Map<string, PaneEphem>();
+    for (const p of bootRef.current!.panes) {
+      if (picks[p.key]) m.set(p.key, defaultPaneEphem(picks[p.key]));
+    }
+    return m;
+  });
   // NOTE: composer draft text is intentionally NOT App state. It lives in
   // Composer-local state + localStorage (draftStore), so typing never
   // re-renders the App tree. App only references drafts to clear abandoned
@@ -1485,6 +1525,7 @@ export function App(): JSX.Element {
       next.delete(key);
       return next;
     });
+    savePaneModel(key, null);
     // Drop the abandoned new-window draft. Deferred so it runs AFTER the
     // closing Composer's unmount flush (which fires during React's commit of
     // the setPanes above) — otherwise that flush would resurrect it.
@@ -2350,6 +2391,7 @@ export function App(): JSX.Element {
                 model={ephem.model}
                 onModelChange={(m) => {
                   updatePaneEphem(pane.key, { model: m });
+                  savePaneModel(pane.key, m);
                 }}
                 thinkingMode={thinkingMode}
                 onThinkingModeChange={(mode) => {
