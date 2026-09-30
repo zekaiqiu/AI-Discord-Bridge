@@ -658,10 +658,19 @@ export function App(): JSX.Element {
   // simultaneously (e.g. recovering A while sending in B) without
   // either one launching duplicate GET .../stream subscribers.
   const recoveryAttachedSidsRef = useRef<Set<string>>(new Set());
-  // Panes with a send in flight (from Enter until the POST is issued):
-  // a second Enter/click meanwhile used to create a second session and
-  // upload+send the same attachments twice.
-  const sendingPanesRef = useRef<Set<string>>(new Set());
+  // Per-pane send SETUP chain (session creation, uploads, ephemeral
+  // snapshot -- from Enter until the turn is started). A second Enter/click
+  // during setup used to create a second session and upload+send the same
+  // attachments twice, so sends on one pane run their setup one after
+  // another.
+  //
+  // It must cover SETUP ONLY, never the streamed turn. The first version
+  // was a Set held across `await runTurn(...)`, i.e. for the whole reply,
+  // and a send typed mid-stream hit it and returned silently -- after the
+  // Composer had already cleared the box. The message vanished and the
+  // interrupt-then-send path below it was unreachable from the same pane.
+  // A later send now WAITS for the earlier setup instead of being dropped.
+  const sendSetupRef = useRef<Map<string, Promise<void>>>(new Map());
   // Monotonic token bumped on every loadSession call. Stale getSession
   // responses (user clicked another session before this one returned)
   // are dropped instead of clobbering the latest view.
@@ -2052,15 +2061,21 @@ export function App(): JSX.Element {
   const handleSend = useCallback(
     async (paneKey: string, text: string) => {
       const trimmed = text.trim();
-      const eph = paneEphemRef.current.get(paneKey) ?? defaultPaneEphem();
-      const ephModel = eph.model ?? modelRef.current;
+      // Snapshotted again after any queued setup finishes -- see below.
+      let eph = paneEphemRef.current.get(paneKey) ?? defaultPaneEphem();
       // Allow an attachments-only send (no text). pendingFiles are the
       // freshly-staged uploads; pendingAttachments covers rehydrated meta.
       const hasAttachments =
         eph.pendingFiles.length > 0 || eph.pendingAttachments.length > 0;
       if (!trimmed && !hasAttachments) return;
-      if (sendingPanesRef.current.has(paneKey)) return;
-      sendingPanesRef.current.add(paneKey);
+      // Queue behind any earlier send's SETUP on this pane (not its turn).
+      const priorSetup = sendSetupRef.current.get(paneKey) ?? Promise.resolve();
+      let releaseSetup: () => void = () => {};
+      const setupDone = new Promise<void>((res) => {
+        releaseSetup = res;
+      });
+      const setupChain = priorSetup.then(() => setupDone);
+      sendSetupRef.current.set(paneKey, setupChain);
       // The Composer clears its box synchronously on send; every early
       // return below must hand the text back or it is silently lost.
       const giveBack = (sid: string | null) => {
@@ -2074,6 +2089,15 @@ export function App(): JSX.Element {
         }
       };
       try {
+      await priorSetup;
+      // Re-read the pane's toggles/attachments now that the earlier send has
+      // taken its own. The snapshot above could still hold that send's
+      // files, which would upload and send them twice.
+      eph = paneEphemRef.current.get(paneKey) ?? defaultPaneEphem();
+      const ephModel = eph.model ?? modelRef.current;
+      if (!trimmed && eph.pendingFiles.length === 0 && eph.pendingAttachments.length === 0) {
+        return;
+      }
       const sid = await ensureSessionForPane(paneKey);
       if (!sid) {
         giveBack(null);
@@ -2150,15 +2174,23 @@ export function App(): JSX.Element {
         ephLevels && effortMapRef.current[ephModel] && ephLevels.includes(effortMapRef.current[ephModel])
           ? effortMapRef.current[ephModel]
           : null;
-      await runTurn(sid, textToSend, {
+      // runTurn registers this turn in streamAbortsRef synchronously, before
+      // its first await, so a send queued behind this setup will see the
+      // turn and interrupt it rather than race it.
+      const turn = runTurn(sid, textToSend, {
         model: ephModel,
         effort: ephEffort,
         webSearch: eph.webSearchOn,
         imageGen: eph.imageGenOn,
         attachments,
       });
+      releaseSetup();
+      await turn;
       } finally {
-        sendingPanesRef.current.delete(paneKey);
+        releaseSetup();
+        if (sendSetupRef.current.get(paneKey) === setupChain) {
+          sendSetupRef.current.delete(paneKey);
+        }
       }
     },
     [ensureSessionForPane, runTurn, interruptTurn, handleAuthExpiry],
