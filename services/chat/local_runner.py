@@ -34,6 +34,16 @@ _LOCAL_MODELS: dict[str, str] = {
     "gemma4-local": "google/gemma-4-31b-qat",
 }
 
+# Gemma 4 is a multimodal family and LM Studio's OpenAI endpoint accepts
+# image_url parts for VL models; if the served build turns out text-only,
+# its 400 is caught by haihub_runner's demote-and-retry, so flagging True
+# is safe (worst case: one extra round-trip, then the text path).
+SUPPORTS_VISION = True
+
+
+def supports_vision(model: str | None) -> bool:
+    return is_local_model(model)
+
 
 def is_local_model(model: str | None) -> bool:
     """True iff ``model`` is one of the local (home-GPU) aliases."""

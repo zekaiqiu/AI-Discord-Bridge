@@ -25,7 +25,7 @@ export const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024;
 
 /** Mirrors attachments.py's ``MAX_FILE_BYTES`` / ``MAX_FILES_PER_TURN``. */
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
-export const MAX_FILES_PER_TURN = 5;
+export const MAX_FILES_PER_TURN = 100;
 
 /**
  * Fraction of the server cap we allow plain text to occupy. The headroom

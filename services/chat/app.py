@@ -2397,10 +2397,19 @@ def _api_attachment_preamble(attachments_dir: Path, tool_path: str) -> str:
         mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
         lines.append(f"  - {tool_path}/{p.name}  ({mime}, {size:,} bytes)")
     return (
-        "[The user attached the following file(s). Read them with the "
-        "run_bash tool before answering (cat/head for text, python for "
-        "spreadsheets and data files, pdftotext or python for PDFs) — do not "
-        "answer without reading them.]\n"
+        "[The user attached the following file(s). Read them before answering "
+        "— do not answer without reading them. Prefer the read_file tool "
+        "(pass it the container path below): it turns any file into text you "
+        "can consume — PDFs are text-extracted or vision-transcribed when "
+        "scanned, Office docs are parsed, audio and video are "
+        "transcribed/described, and images are read by a vision model. For "
+        "plain text/code/CSV, run_bash also works: cat/head for text; python "
+        "(pandas/openpyxl) for spreadsheets; python (pypdf) for PDFs (the "
+        "system poppler tools are not installed here); python (python-docx / "
+        "python-pptx) for .docx/.pptx; cat the raw markup for .svg (do not "
+        "try to render it).] Attached raster images are additionally "
+        "delivered as inline image parts when the endpoint supports them — "
+        "if you see image content, trust what you see, not the filename.\n"
         + "\n".join(lines)
         + "\n\n"
     )
@@ -2436,6 +2445,16 @@ async def _api_model_turn_gen(
         else kimi_runner if kimi_runner.is_kimi_model(model)
         else haihub_runner
     )
+    # Inline-vision capability of the endpoint this turn will actually hit.
+    # Per-MODEL, not per-module: haihub's gateway accepts image_url parts on
+    # every model but DeepSeek/MiniMax silently ignore the pixels (live
+    # probe, 2026-10-05), so a module-level True would still leave those
+    # turns blind. Each runner exposes supports_vision(model) -> bool; a
+    # legacy/unknown runner without it degrades to the old text-only
+    # preamble.
+    _sv = getattr(runner, "supports_vision", None)
+    vision_capable = bool(_sv(model)) if callable(_sv) \
+        else bool(getattr(runner, "SUPPORTS_VISION", False))
     tool_container = container
     tool_workdir = "/workspace"
     tool_home = "/workspace"
@@ -2476,6 +2495,12 @@ async def _api_model_turn_gen(
         tool_workdir=tool_workdir,
         tool_home=tool_home,
         artifacts_path=tool_artifacts,
+        # Multimodal upload: on capable endpoints the runner inlines the
+        # session's sniffed raster attachments as image parts (the preamble
+        # above still names every file, so text/binary uploads keep the
+        # run_bash path and a vision rejection degrades, never errors).
+        attachments_dir=attachments_dir,
+        vision=vision_capable,
     )
 
 

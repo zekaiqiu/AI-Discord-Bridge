@@ -35,6 +35,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 import docker
@@ -42,7 +43,9 @@ import httpx
 from concurrent.futures import ThreadPoolExecutor
 
 import prompt_blocks
+import read_file_tool
 import token_ledger
+import vision as vision_mod
 
 logger = logging.getLogger("chat.haihub_runner")
 
@@ -75,6 +78,30 @@ _HAIHUB_MODELS: dict[str, str] = {
     "deepseek": "DeepSeek-V4-Flash",
     "minimax": "MiniMax-M2.7",
 }
+
+# Probed 2026-10-05 (live, image-token verified): haihub's gateway accepts
+# the OpenAI image_url shape on every model, but only SOME models actually
+# read the pixels — DeepSeek-V4-Flash bills 18 prompt tokens (text only,
+# image dropped) and hallucinates from the filename; MiniMax-M2.7 bills 52
+# and reasons "I don't see any image". Qwen3.5-397B-A17B-FP8 bills ~100
+# (text+image) and answers from the picture. SUPPORTS_VISION_MODELS lists
+# the display names that passed a "read the token in this PNG" probe; the
+# app consults it per resolved model, so a deepseek/minimax turn never
+# pays for a payload the provider will silently discard.
+SUPPORTS_VISION = True  # module-level: at least one served model sees images
+SUPPORTS_VISION_MODELS: frozenset[str] = frozenset({
+    "Qwen3.5-397B-A17B-FP8",
+})
+
+
+def supports_vision(model: str | None) -> bool:
+    """True iff the resolved haihub display name is probe-verified to read
+    inline image parts. Unknown/legacy aliases degrade to text-only — the
+    attachments are still named in the preamble and readable via run_bash,
+    so a False here never strands a file, it just skips the inline parts."""
+    if not model:
+        return False
+    return _HAIHUB_MODELS.get(model, model) in SUPPORTS_VISION_MODELS
 
 _MAX_TOKENS = 8192
 # No hard cap on model<->tool round-trips: the loop runs until the model
@@ -182,7 +209,19 @@ _REP_TERMINAL = re.compile(r"[.!?。！？][\"'”’)\]]*$")
 
 
 def _message_chars(m: dict[str, Any]) -> int:
-    n = len(m.get("content") or "") if isinstance(m.get("content"), str) else 0
+    c = m.get("content")
+    if isinstance(c, str):
+        n = len(c)
+    elif isinstance(c, list):
+        # Multimodal user turn: budget the text part(s) plus a fixed
+        # estimate per inline image (provider tokenises pixels, not
+        # base64, but the request still has to stay sane-sized).
+        n = sum(len(str(part.get("text") or "")) for part in c
+                if isinstance(part, dict) and part.get("type") == "text")
+        n += sum(4000 for part in c
+                 if isinstance(part, dict) and part.get("type") == "image_url")
+    else:
+        n = 0
     for tc in m.get("tool_calls") or []:
         n += len(((tc.get("function") or {}).get("arguments")) or "")
     rc = m.get("reasoning_content")
@@ -347,9 +386,13 @@ _SYSTEM_PROMPT_TOOLS = (
     "tool; each call executes in /workspace inside an isolated per-user "
     "container (your HOME is /workspace, no access to the host). Use it to "
     "read and write files, run code, install packages, and inspect the "
-    "environment. Persist anything you create under /workspace. Take as many "
-    "tool steps as you need, then reply to the user with a normal answer. "
-    "Format responses using GitHub-flavored Markdown."
+    "environment. You also have a read_file tool that turns any attached file "
+    "into text you can consume — PDFs, Office docs, audio, video, and images "
+    "(transcribed/described by a vision model). Use read_file for any "
+    "attachment you cannot fully decode with run_bash. Persist anything you "
+    "create under /workspace. Take as many tool steps as you need, then reply "
+    "to the user with a normal answer. Format responses using GitHub-flavored "
+    "Markdown."
 )
 
 # Admin sessions have no per-user container; their tools run in the
@@ -362,10 +405,12 @@ _SYSTEM_PROMPT_TOOLS_HOST = (
     "Linux host shell. You can run shell commands with the run_bash tool; "
     "each call executes as uid 1000 with HOME=/home/felix on the operator "
     "host. Use it to read and write files, run code, and inspect services. "
-    "Files you create for the user belong under the artifacts directory you "
-    "were given. Take as many tool steps as you need, then reply to the "
-    "user with a normal answer. Format responses using GitHub-flavored "
-    "Markdown."
+    "You also have a read_file tool that turns any attached file into text "
+    "you can consume — PDFs, Office docs, audio, video, and images. Use it "
+    "for any attachment you cannot fully decode with run_bash. Files you "
+    "create for the user belong under the artifacts directory you were given. "
+    "Take as many tool steps as you need, then reply to the user with a "
+    "normal answer. Format responses using GitHub-flavored Markdown."
 )
 
 _TOOLS = [
@@ -390,7 +435,36 @@ _TOOLS = [
                 "required": ["command"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read any attached/local file and return its content as "
+                "text you can consume. Use it for PDFs (text-extracted, or "
+                "transcribed by a vision model when scanned), Office docs "
+                "(docx/pptx/xlsx), audio and video (transcribed/described), "
+                "and any image you want to inspect in detail. Prefer this "
+                "over run_bash for PDFs/audio/video, which the sandbox "
+                "cannot decode on its own."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file (as named in the attachment preamble).",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Optional specific question about the file's content.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 _LANGUAGE_NAMES = {
@@ -400,6 +474,44 @@ _LANGUAGE_NAMES = {
     "de": "German (Deutsch)",
     "tl": "Tagalog (Filipino)",
 }
+
+
+# Container-side prefix where attachment files are staged for the model's
+# run_bash (mirrors claude_runner.USER_CONTAINER_ATTACHMENTS_ROOT). The
+# read_file tool runs chat-backend-side, so a model-supplied container path
+# must be mapped back to the chat-side attachments dir before opening.
+_CONTAINER_ATTACH_PREFIX = "/workspace/.attachments"
+
+
+def _readfile_container_path(path_arg: str, chat_session_id: str,
+                             attachments_dir: Any) -> str:
+    """Map a sandbox container path back to the chat-side attachments path.
+
+    The preamble hands the model container paths like
+    ``/workspace/.attachments/<sid>/<name>``; read_file runs backend-side and
+    must open ``<attachments_dir>/<name>`` instead. Non-container paths pass
+    through unchanged (confinement enforced by read_file via allowed_root).
+    """
+    if not attachments_dir:
+        return path_arg
+    p = path_arg.strip()
+    prefix = f"{_CONTAINER_ATTACH_PREFIX}/{chat_session_id}/"
+    if p.startswith(prefix):
+        return str(Path(attachments_dir) / p[len(prefix):])
+    # Bare filename (no dir) resolves against the attachments dir.
+    if "/" not in p:
+        return str(Path(attachments_dir) / p)
+    return path_arg
+
+
+def _readfile_allowed_root(attachments_dir: Any) -> Path | None:
+    """Confine read_file to the session's attachments dir when one exists."""
+    if not attachments_dir:
+        return None
+    try:
+        return Path(attachments_dir)
+    except (TypeError, ValueError):
+        return None
 
 
 def is_haihub_model(model: str | None) -> bool:
@@ -680,13 +792,23 @@ async def _stream_step_raw(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    try:
-        async with client.stream("POST", url, headers=headers, json=payload) as resp:
+    # Multimodal robustness: a provider that rejects the content-array form
+    # (400 — e.g. a gateway whose image pipeline is down, or a capability
+    # probe that went stale) must not fail the user's turn. ``_once`` reports
+    # a non-200 via the ``_http`` sentinel; the outer loop then demotes every
+    # list-typed message content to its text parts and retries ONCE. The
+    # attachment preamble in the text still names every file and run_bash
+    # can still read them, so the model degrades to the pre-vision behaviour
+    # instead of the turn erroring out.
+    vision_demoted = False
+
+    async def _once() -> AsyncIterator[dict[str, Any]]:
+        nonlocal finish_reason, usage, degenerate
+        try:
+          async with client.stream("POST", url, headers=headers, json=payload) as resp:
             if resp.status_code != 200:
                 body = (await resp.aread()).decode("utf-8", "replace")[:300]
-                logger.warning("haihub HTTP %s: %s", resp.status_code, body)
-                yield {"type": "_error",
-                       "message": f"haihub HTTP {resp.status_code}{_provider_error_suffix(body)}"}
+                yield {"type": "_http", "status": resp.status_code, "body": body}
                 return
             # Split on "\n" ourselves: httpx's aiter_lines() uses str.splitlines(),
             # which also breaks on U+2028/U+2029/U+0085 — characters JSON does
@@ -779,9 +901,52 @@ async def _stream_step_raw(
                             slot["args"] += fn["arguments"]
                 if stream_done:
                     break
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("haihub stream failed")
-        yield {"type": "_error", "message": f"haihub request failed: {type(exc).__name__}"}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("haihub stream failed")
+            yield {"type": "_error", "message": f"haihub request failed: {type(exc).__name__}"}
+            return
+
+    while True:
+        terminal: dict[str, Any] | None = None
+        async for ev in _once():
+            if ev["type"] == "_http":
+                terminal = ev
+                break
+            yield ev
+        if terminal is None:
+            break  # ran to completion (degenerate / [DONE] / in-band error)
+        status = int(terminal.get("status") or 0)
+        body = str(terminal.get("body") or "")
+        has_parts = any(isinstance(m.get("content"), list)
+                        for m in payload.get("messages") or [])
+        if status == 400 and has_parts and not vision_demoted:
+            vision_demoted = True
+            logger.warning(
+                "haihub HTTP 400 with multimodal payload; demoting to "
+                "text-only and retrying: %s", body[:160],
+            )
+            for m in payload.get("messages") or []:
+                c = m.get("content")
+                if isinstance(c, list):
+                    m["content"] = "\n\n".join(
+                        str(part.get("text") or "")
+                        for part in c
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
+            # Fresh stream state for the retried request.
+            stripper = _ThinkStripper()
+            content_parts = []
+            cguard = _RepetitionGuard()
+            rguard = _RepetitionGuard()
+            degenerate = None
+            tool_acc = {}
+            id_slots = {}
+            finish_reason = None
+            usage = None
+            continue
+        logger.warning("haihub HTTP %s: %s", status, body)
+        yield {"type": "_error",
+               "message": f"haihub HTTP {status}{_provider_error_suffix(body)}"}
         return
 
     if degenerate:
@@ -850,6 +1015,8 @@ async def run_turn(
     artifacts_path: str | None = None,
     fallback: dict[str, str] | None = None,
     on_failover: Callable[[str], None] | None = None,
+    attachments_dir: Any = None,
+    vision: bool = False,
     **_ignored: Any,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one turn from an OpenAI-compatible model as normalized events.
@@ -870,6 +1037,16 @@ async def run_turn(
     for the same model: when a step fails with a limit/auth error before
     any output, the rest of the turn moves there (once) and the step is
     redone. ``on_failover(message)`` is called when that happens.
+
+    ``attachments_dir`` + ``vision``: when the caller has probed this
+    provider as image-capable (``vision=True``) and the session's upload
+    dir holds sniffed raster images, the FIRST step's user message becomes
+    an OpenAI content array (image_url data-URI parts + the text part) and
+    the system prompt gains a one-line "you can see these" note. Text-only
+    turns, unsupported providers (``vision=False``), and providers that
+    400 the multimodal payload all use / fall back to the plain string
+    form — so a text attachment can never turn a turn multimodal, and a
+    vision failure can never kill the turn.
     """
     mmap = models_map or _HAIHUB_MODELS
     base = (base_url or HAIHUB_BASE_URL).rstrip("/")
@@ -912,9 +1089,53 @@ async def run_turn(
     _identity = prompt_blocks.model_identity_directive(model)
     if _identity:
         _system = f"{_identity}\n\n{_system}"
+    user_message_content: Any = user_content
+    if attachments_dir is not None:
+        if vision:
+            # Vision-capable endpoint: inline the images as content parts.
+            parts, inlined = vision_mod.build_content_parts(
+                user_content, Path(attachments_dir)
+            )
+            if parts is not None:
+                user_message_content = parts
+                _system = f"{_system}\n\n{vision_mod.inline_preamble_note(inlined)}"
+                logger.info(
+                    "vision: inlining %d image(s) for %s: %s",
+                    len(inlined), display, ", ".join(inlined),
+                )
+        else:
+            # Text-only endpoint (glm, deepseek, minimax): convert each image
+            # to a Gemini-generated text description and inject it into the
+            # prompt. This is the ONLY way these models can "see" an image —
+            # run_bash returns text, not pixels.
+            descriptions = vision_mod.build_text_descriptions(
+                Path(attachments_dir),
+                question="Describe this image in detail. If there is text, read it exactly.",
+            )
+            if descriptions:
+                blocks = [
+                    f"--- Attached image: {name} ---\n{desc}"
+                    for name, desc in descriptions
+                ]
+                user_message_content = (
+                    "\n\n".join(blocks) + "\n\n" + user_content
+                )
+                _system = (
+                    f"{_system}\n\n"
+                    "[Vision: the user's message includes attached image(s), "
+                    "provided as text descriptions above (this endpoint cannot "
+                    "receive images directly). Answer based on the description "
+                    "— do not claim you cannot view images, and do not ask the "
+                    "user to describe them.]"
+                )
+                logger.info(
+                    "vision: OCR'd %d image(s) for text-only %s: %s",
+                    len(descriptions), display,
+                    ", ".join(n for n, _ in descriptions),
+                )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _system},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": user_message_content},
     ]
 
     # Visible text of every model step, in order. The reply the user keeps is
@@ -1226,8 +1447,28 @@ async def run_turn(
                     except json.JSONDecodeError:
                         args = {}
                     command = args.get("command", "") if isinstance(args, dict) else ""
-                    if name != "run_bash":
-                        result = f"[error: unknown tool {name!r}]"
+                    if name == "read_file":
+                        rf_path = args.get("path", "") if isinstance(args, dict) else ""
+                        rf_q = args.get("question", "") if isinstance(args, dict) else ""
+                        if not rf_path:
+                            result = "[error: read_file called without a 'path']"
+                        else:
+                            yield {
+                                "type": "tool_start",
+                                "name": "read_file",
+                                "input_summary": str(rf_path)[:200],
+                            }
+                            result = await asyncio.to_thread(
+                                read_file_tool.read_file,
+                                _readfile_container_path(
+                                    str(rf_path), chat_session_id, attachments_dir,
+                                ),
+                                rf_q if isinstance(rf_q, str) else "",
+                                _readfile_allowed_root(attachments_dir),
+                            )
+                            yield {"type": "tool_end", "name": "read_file"}
+                    elif name != "run_bash":
+                        result = f"[error: unknown tool {name!r} — available: run_bash, read_file]"
                     elif not command:
                         result = "[error: run_bash called without a 'command']"
                     else:

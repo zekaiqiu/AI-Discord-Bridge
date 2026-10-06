@@ -444,7 +444,12 @@ function attachmentPreviewUrl(
 }
 
 function isImageMime(mime: string | undefined): boolean {
-  return typeof mime === "string" && mime.startsWith("image/");
+  // SVG is markup, not pixels: an <img> to a same-origin preview URL would
+  // run any inline <script> in the user's session. Render it as a file
+  // chip (download/open-in-tab) like every other non-raster attachment.
+  if (typeof mime !== "string") return false;
+  if (mime.toLowerCase().startsWith("image/svg")) return false;
+  return mime.startsWith("image/");
 }
 
 interface BubbleAttachmentsProps {

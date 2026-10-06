@@ -25,6 +25,17 @@ openpyxl>=3.1,<4.0
 xlsxwriter>=3.1,<4.0
 fastparquet>=2024.0
 
+# --- Attachment readers ------------------------------------------------------
+# The chat attachment preamble tells API-path models to read uploads with
+# python (see app._api_attachment_preamble). These close the gaps that
+# actually bit: pypdf for PDFs (no pdftotext/poppler in the image), the
+# docx/xlsx/pptx trinity for Office files, Pillow for image formats the
+# inline-vision path transcodes (BMP/TIFF/AVIF — see vision.py).
+pypdf>=4.0
+python-docx>=1.1
+python-pptx>=0.6.23
+Pillow>=10.0
+
 # --- Market-data sources -----------------------------------------------------
 yfinance>=0.2.40
 pandas-datareader>=0.10

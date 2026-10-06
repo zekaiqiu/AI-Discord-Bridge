@@ -271,6 +271,9 @@ THINKING_LEVELS = ("off", "brief", "full")
 # Tool-use narration ("🔧 using tool: `Bash`") in Discord is hidden by
 # default; set BRIDGE_SHOW_TOOL_USE=1 to bring it back.
 SHOW_TOOL_USE = os.environ.get("BRIDGE_SHOW_TOOL_USE", "").strip().lower() in ("1", "true", "yes")
+# Token-spend alerts ("Token alert: large turn/daily ...") are off by
+# default; set BRIDGE_TOKEN_ALERTS=1 to re-enable the 120s alert loop.
+TOKEN_ALERTS_ENABLED = os.environ.get("BRIDGE_TOKEN_ALERTS", "").strip().lower() in ("1", "true", "yes")
 DEFAULT_THINKING_LEVEL = "brief"
 THINKING_BRIEF_CHARS = int(os.environ.get("BRIDGE_THINKING_BRIEF_CHARS", "300"))
 
@@ -774,7 +777,43 @@ _QWEN_TOOLS = [
                 "required": ["command"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read any file and return its content as text you can "
+                "consume: images are described and their text transcribed "
+                "by a vision model, PDFs are text-extracted (vision "
+                "fallback for scanned documents), Office documents "
+                "(docx/pptx/xlsx) are converted to text, audio and video "
+                "are transcribed/described, archives and directories are "
+                "listed, plain text/code/data is returned verbatim. Use "
+                "this for Discord attachments and for any file on disk you "
+                "need to see — run_bash cannot show you images."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path, or relative to the working directory.",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "Optional specific question about an "
+                            "image/audio/video/PDF (e.g. 'what does the "
+                            "error message say?'). Omit for a full "
+                            "description/transcription."
+                        ),
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 
@@ -785,13 +824,16 @@ def _haihub_system_prompt(label: str, *, emergency: bool) -> str:
     )
     return (
         f"You are the Work Assistant, currently running as {label} ({why}). You "
-        "have a single tool, run_bash, that executes commands on the HOST with "
-        f"full access (working directory {WORKING_DIR}). Use it for any file "
-        "reads/writes, git, docker, or system inspection — there is no separate "
-        "Read/Edit tool, do everything through run_bash. Take as many tool steps "
-        "as you need, then reply to the user with a normal answer in "
-        "GitHub-flavored Markdown. Be careful: these commands run for real on "
-        "the production host."
+        "have two tools, both operating on the HOST with full access (working "
+        f"directory {WORKING_DIR}): run_bash (bash commands — file operations, "
+        "running code, git, docker, system inspection) and read_file (turns "
+        "any file into text you can consume — images via a vision model, "
+        "PDFs, Office docs, audio/video, archives, plain files). There is no "
+        "separate Read/Edit tool: use run_bash to write/modify files and "
+        "read_file to look at anything, especially Discord-attached images. "
+        "Take as many tool steps as you need, then reply to the user with a "
+        "normal answer in GitHub-flavored Markdown. Be careful: these "
+        "commands run for real on the production host."
     )
 
 
@@ -871,6 +913,356 @@ async def _qwen_exec_bash_host(command: str) -> str:
     if len(out) > _QWEN_MAX_TOOL_OUTPUT:
         out = out[:_QWEN_MAX_TOOL_OUTPUT] + f"\n[...output truncated at {_QWEN_MAX_TOOL_OUTPUT} chars...]"
     return out if out.strip() else f"(exit code {proc.returncode}, no output)"
+
+
+# ---------------------------------------------------------------------------
+# read_file — the tool-loop model's eyes. Claude reads attachments with its
+# built-in Read tool, but the OpenAI-compatible loop (Kimi / haihub / MiMo)
+# is text-only: without this, any attached image/PDF/audio was invisible to
+# it ("some models can't read pictures"). read_file converts ANY file into
+# model-consumable text:
+#   images / audio / video / scanned PDFs -> Gemini 2.5-flash multimodal
+#   PDFs with a text layer                -> pypdf extraction
+#   Office docs (docx / pptx / xlsx)      -> stdlib zip+XML extraction
+#   archives (zip / tar / tgz / gz)       -> content listing
+#   directories                           -> ls-style listing
+#   text / code / data                    -> returned verbatim (capped)
+#   anything else                         -> `file` identification + hex head
+# ---------------------------------------------------------------------------
+
+# gemini-flash-latest tracks the current flash model — pinned versioned names
+# (gemini-2.5-flash) get retired and start 404ing, which is exactly what
+# happened to the first cut of this. Override with BRIDGE_VISION_MODEL.
+_VISION_MODEL = os.environ.get("BRIDGE_VISION_MODEL", "gemini-flash-latest")
+_GEMINI_FLASH_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/"
+    f"models/{_VISION_MODEL}:generateContent"
+)
+_READFILE_GEMINI_MAX_BYTES = 18 * 1024 * 1024  # inline-request ceiling
+_READFILE_TEXT_MAX = 30000     # chars of file text fed back per read_file call
+_READFILE_LIST_MAX = 500       # dir/archive entries fed back
+_READFILE_VISION_TIMEOUT = 180.0
+
+_READFILE_IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+    ".tiff": "image/tiff", ".tif": "image/tiff", ".heic": "image/heic",
+}
+_READFILE_AUDIO_MIME = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg", ".oga": "audio/ogg", ".flac": "audio/flac",
+    ".aac": "audio/aac", ".opus": "audio/ogg",
+}
+_READFILE_VIDEO_MIME = {
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+    ".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".m4v": "video/mp4",
+}
+_READFILE_OFFICE_EXTS = {".docx", ".docm", ".pptx", ".pptm", ".xlsx", ".xlsm"}
+
+_READFILE_PROMPTS = {
+    "image": (
+        "You are the eyes of a text-only model working with this image. "
+        "Describe it thoroughly: transcribe ALL visible text verbatim "
+        "(preserve rough layout), render any tables as markdown, describe "
+        "charts/diagrams (axes, values, trends), UI elements, and anything "
+        "else a reader would need. Be complete and literal."
+    ),
+    "audio": (
+        "You are the ears of a text-only model working with this audio. "
+        "Transcribe all speech verbatim, then describe any non-speech "
+        "sounds, tone, and context."
+    ),
+    "video": (
+        "You are the eyes of a text-only model working with this video. "
+        "Describe it: scenes and key events with rough timestamps, "
+        "transcribe on-screen text and speech verbatim, describe charts or "
+        "UI shown."
+    ),
+    "pdf": (
+        "You are the eyes of a text-only model working with this scanned "
+        "PDF. Transcribe each page's text verbatim (preserve rough layout), "
+        "render tables as markdown, and describe any figures."
+    ),
+}
+
+
+def _gemini_file_to_text(data: bytes, mime: str, prompt: str, api_key: str,
+                         *, timeout: float = _READFILE_VISION_TIMEOUT) -> str:
+    """Synchronous Gemini 2.5-flash multimodal call; returns the text reply.
+    urllib only, mirroring _gemini_image_call."""
+    import base64
+    import urllib.request
+    body = json.dumps({
+        "contents": [{"parts": [
+            {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode("ascii")}},
+            {"text": prompt},
+        ]}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        _GEMINI_FLASH_URL, data=body,
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    bits: list[str] = []
+    for c in payload.get("candidates") or []:
+        for part in (c.get("content") or {}).get("parts") or []:
+            t = part.get("text")
+            if t:
+                bits.append(t)
+    if not bits:
+        raise RuntimeError(f"gemini returned no text: {json.dumps(payload)[:200]}")
+    return "".join(bits)
+
+
+def _readfile_unescape(text: str) -> str:
+    import html
+    return html.unescape(text)
+
+
+def _readfile_office_text(path: Path) -> str:
+    """Stdlib zip+XML text extraction for docx / pptx / xlsx."""
+    import zipfile
+    ext = path.suffix.lower()
+    out: list[str] = []
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        if ext in (".docx", ".docm"):
+            txt = z.read("word/document.xml").decode("utf-8", "replace")
+            txt = re.sub(r"<w:tab\b[^>]*/?>", "\t", txt)
+            txt = re.sub(r"<w:br\b[^>]*/?>", "\n", txt)
+            txt = re.sub(r"</w:p>", "\n", txt)
+            txt = re.sub(r"<[^>]+>", "", txt)
+            out.append(_readfile_unescape(txt))
+        elif ext in (".pptx", ".pptm"):
+            slides = sorted(
+                (n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                key=lambda n: int(re.search(r"\d+", n.rsplit("/", 1)[1]).group()),
+            )
+            for i, name in enumerate(slides, 1):
+                txt = z.read(name).decode("utf-8", "replace")
+                texts = [_readfile_unescape(t) for t in re.findall(r"<a:t>(.*?)</a:t>", txt, re.S)]
+                out.append(f"--- slide {i} ---\n" + "\n".join(texts))
+        else:  # xlsx / xlsm
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in names:
+                sx = z.read("xl/sharedStrings.xml").decode("utf-8", "replace")
+                for si in re.findall(r"<si>(.*?)</si>", sx, re.S):
+                    shared.append(_readfile_unescape(
+                        "".join(re.findall(r"<t[^>]*>(.*?)</t>", si, re.S))))
+            wb = z.read("xl/workbook.xml").decode("utf-8", "replace")
+            sheet_names = [_readfile_unescape(n) for n in
+                           re.findall(r'<sheet[^>]*\bname="([^"]+)"', wb)]
+            sheets = sorted(
+                (n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
+                key=lambda n: int(re.search(r"\d+", n.rsplit("/", 1)[1]).group()),
+            )
+            for i, name in enumerate(sheets):
+                label = sheet_names[i] if i < len(sheet_names) else name
+                out.append(f"--- sheet: {label} ---")
+                sx = z.read(name).decode("utf-8", "replace")
+                rows = re.findall(r"<row[^>]*>(.*?)</row>", sx, re.S)
+                for row in rows[:2000]:
+                    cells: list[str] = []
+                    for attrs, body in re.findall(r"<c\b([^>]*)>(.*?)</c>", row, re.S):
+                        t = re.search(r'\bt="(\w+)"', attrs)
+                        t = t.group(1) if t else ""
+                        v = re.search(r"<v>(.*?)</v>", body, re.S)
+                        inline = re.search(r"<is>.*?<t[^>]*>(.*?)</t>.*?</is>", body, re.S)
+                        if t == "s" and v:
+                            idx = int(v.group(1))
+                            cells.append(shared[idx] if idx < len(shared) else "")
+                        elif inline:
+                            cells.append(_readfile_unescape(inline.group(1)))
+                        elif v:
+                            cells.append(_readfile_unescape(v.group(1)))
+                        else:
+                            cells.append("")
+                    out.append("\t".join(cells).rstrip())
+                if len(rows) > 2000:
+                    out.append(f"[...sheet truncated at 2000 of {len(rows)} rows...]")
+    return "\n".join(out)
+
+
+def _readfile_pdf_text(path: Path) -> tuple[str, int]:
+    """(extracted text, page count) via pypdf."""
+    import pypdf
+    reader = pypdf.PdfReader(str(path))
+    parts = [(pg.extract_text() or "") for pg in reader.pages[:200]]
+    return "\n".join(parts), len(reader.pages)
+
+
+def _readfile_archive_listing(path: Path) -> str:
+    import gzip
+    import tarfile
+    import zipfile
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            infos = z.infolist()
+            lines = [f"zip archive: {len(infos)} entries"]
+            lines += [f"{i.file_size:>10}  {i.filename}" for i in infos[:_READFILE_LIST_MAX]]
+            if len(infos) > _READFILE_LIST_MAX:
+                lines.append(f"[...{len(infos) - _READFILE_LIST_MAX} more entries...]")
+            return "\n".join(lines)
+    if tarfile.is_tarfile(path):
+        with tarfile.open(path) as t:
+            members = t.getmembers()
+            lines = [f"tar archive: {len(members)} entries"]
+            lines += [f"{m.size:>10}  {m.name}" for m in members[:_READFILE_LIST_MAX]]
+            if len(members) > _READFILE_LIST_MAX:
+                lines.append(f"[...{len(members) - _READFILE_LIST_MAX} more entries...]")
+            return "\n".join(lines)
+    if path.name.lower().endswith(".gz"):
+        with gzip.open(path, "rb") as f:
+            raw = f.read(_READFILE_TEXT_MAX * 2)
+        try:
+            return raw.decode("utf-8")[:_READFILE_TEXT_MAX]
+        except UnicodeDecodeError:
+            return f"[gzip-compressed binary, {len(raw)}+ bytes decompressed — use run_bash to inspect]"
+    return ""
+
+
+def _readfile_dir_listing(path: Path) -> str:
+    entries = sorted(path.iterdir(), key=lambda e: e.name)
+    lines = [f"directory listing of {path} ({len(entries)} entries):"]
+    for e in entries[:_READFILE_LIST_MAX]:
+        kind = "d" if e.is_dir() else "f"
+        try:
+            size = e.stat().st_size
+        except OSError:
+            size = -1
+        lines.append(f"{kind} {size:>12}  {e.name}")
+    if len(entries) > _READFILE_LIST_MAX:
+        lines.append(f"[...{len(entries) - _READFILE_LIST_MAX} more entries...]")
+    return "\n".join(lines)
+
+
+def _readfile_binary_info(path: Path) -> str:
+    """Last-resort identification for unknown binary files."""
+    try:
+        desc = subprocess.run(
+            ["file", "-b", str(path)], capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except Exception:
+        desc = ""
+    try:
+        head = path.read_bytes()[:256].hex(" ")
+    except OSError:
+        head = ""
+    return (
+        f"[binary file: {desc or 'unknown type'}]\nfirst 256 bytes (hex):\n{head}\n"
+        "Use run_bash for deeper inspection (strings, xxd, etc.)."
+    )
+
+
+def _readfile_cap(text: str, what: str) -> str:
+    if len(text) > _READFILE_TEXT_MAX:
+        return (text[:_READFILE_TEXT_MAX] +
+                f"\n[...{what} truncated at {_READFILE_TEXT_MAX} chars — "
+                "use run_bash (sed/grep/dd) to read further slices...]")
+    return text
+
+
+async def _readfile_via_gemini(path: Path, mime: str, kind: str,
+                               question: str, size: int) -> str:
+    if size > _READFILE_GEMINI_MAX_BYTES:
+        return (f"[read_file: {path.name} is {size / 1e6:.1f} MB — too large for the "
+                f"vision model (cap {_READFILE_GEMINI_MAX_BYTES // (1024 * 1024)} MB). "
+                "Use run_bash to slice/sample it first (e.g. ffmpeg frames for video).]")
+    key = _resolve_gemini_key()
+    if not key:
+        return (f"[read_file: cannot interpret {kind} files — GEMINI_API_KEY is not "
+                "configured on the bridge host]")
+    prompt = _READFILE_PROMPTS[kind]
+    if question:
+        prompt += (f"\n\nThe reader's specific question: {question}\n"
+                   "Answer it directly first, then give the full description/transcription.")
+    try:
+        data = await asyncio.to_thread(path.read_bytes)
+        text = await asyncio.to_thread(_gemini_file_to_text, data, mime, prompt, key)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("read_file vision call failed for %s", path)
+        return f"[read_file: vision model failed on {path.name}: {type(exc).__name__}: {exc}]"
+    return _readfile_cap(text.strip(), "vision reply") or "[read_file: vision model returned no text]"
+
+
+async def _qwen_read_file(path_arg: str, question: str = "") -> str:
+    """The read_file tool: turn any file into text the model can consume."""
+    p = Path(path_arg).expanduser()
+    if not p.is_absolute():
+        p = WORKING_DIR / p
+    if not p.exists():
+        return f"[read_file: no such file: {p}]"
+    if p.is_dir():
+        try:
+            return await asyncio.to_thread(_readfile_dir_listing, p)
+        except OSError as exc:
+            return f"[read_file: cannot list {p}: {exc}]"
+    try:
+        size = p.stat().st_size
+    except OSError as exc:
+        return f"[read_file: cannot stat {p}: {exc}]"
+    ext = p.suffix.lower()
+    name_l = p.name.lower()
+
+    header = f"[{p.name} — {size} bytes]"
+    try:
+        if ext in _READFILE_OFFICE_EXTS:
+            text = await asyncio.to_thread(_readfile_office_text, p)
+            return header + "\n" + _readfile_cap(text.strip() or "(no extractable text)", "document text")
+        if (ext in {".zip", ".jar", ".tar", ".tgz", ".tbz2", ".gz"}
+                or name_l.endswith((".tar.gz", ".tar.bz2", ".tar.xz"))):
+            listing = await asyncio.to_thread(_readfile_archive_listing, p)
+            if listing:
+                return header + "\n" + listing
+        if ext == ".pdf":
+            text, npages = await asyncio.to_thread(_readfile_pdf_text, p)
+            if len(text.strip()) >= max(40, 10 * npages):
+                return (f"{header} [{npages} page(s), text layer]\n"
+                        + _readfile_cap(text.strip(), "pdf text"))
+            # No usable text layer — scanned document; read it visually.
+            return await _readfile_via_gemini(p, "application/pdf", "pdf", question, size)
+        if ext in _READFILE_IMAGE_MIME:
+            return await _readfile_via_gemini(p, _READFILE_IMAGE_MIME[ext], "image", question, size)
+        if ext in _READFILE_AUDIO_MIME:
+            return await _readfile_via_gemini(p, _READFILE_AUDIO_MIME[ext], "audio", question, size)
+        if ext in _READFILE_VIDEO_MIME:
+            return await _readfile_via_gemini(p, _READFILE_VIDEO_MIME[ext], "video", question, size)
+        # Text probe: decode as UTF-8 unless it looks binary.
+        raw = await asyncio.to_thread(p.read_bytes)
+        if b"\x00" not in raw[:8192]:
+            try:
+                return header + "\n" + _readfile_cap(raw.decode("utf-8"), "file text")
+            except UnicodeDecodeError:
+                pass
+        return header + "\n" + await asyncio.to_thread(_readfile_binary_info, p)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("read_file failed for %s", p)
+        return f"[read_file: failed to read {p.name}: {type(exc).__name__}: {exc}]"
+
+
+async def _qwen_dispatch_tool(name: str, args: dict, sink: "StreamSink | None") -> str:
+    """Execute one tool call from the OpenAI-compatible loop; return the
+    string fed back to the model."""
+    if not isinstance(args, dict):
+        args = {}
+    if name == "run_bash":
+        command = args.get("command", "")
+        if not isinstance(command, str) or not command:
+            return "[error: run_bash called without a 'command']"
+        if sink is not None:
+            await sink.feed("tool", "using tool: `run_bash`\n")
+        return await _qwen_exec_bash_host(command)
+    if name == "read_file":
+        path = args.get("path", "")
+        if not isinstance(path, str) or not path:
+            return "[error: read_file called without a 'path']"
+        question = args.get("question", "")
+        if sink is not None:
+            await sink.feed("tool", f"using tool: `read_file` {path}\n")
+        return await _qwen_read_file(path, question if isinstance(question, str) else "")
+    return f"[error: unknown tool {name!r} — available: run_bash, read_file]"
 
 
 async def _qwen_stream_step(
@@ -1111,15 +1503,7 @@ async def _run_haihub(
                         args = json.loads(tc["args"] or "{}")
                     except json.JSONDecodeError:
                         args = {}
-                    command = args.get("command", "") if isinstance(args, dict) else ""
-                    if tc["name"] != "run_bash":
-                        result = f"[error: unknown tool {tc['name']!r}]"
-                    elif not command:
-                        result = "[error: run_bash called without a 'command']"
-                    else:
-                        if sink is not None:
-                            await sink.feed("tool", f"using tool: `run_bash`\n")
-                        result = await _qwen_exec_bash_host(command)
+                    result = await _qwen_dispatch_tool(tc["name"] or "", args, sink)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": cid,
@@ -1204,8 +1588,10 @@ async def _run_claude(
     if attachments_dir is not None and attachment_files:
         files_listing = "\n".join(f"- {attachments_dir / f}" for f in attachment_files)
         sections.append(
-            "[Attachments in this turn — use Read on these paths "
-            "(handles images, PDFs, text):\n"
+            "[Attachments in this turn — read them with your file-reading "
+            "tool (Read on Claude, read_file on tool-loop models; it "
+            "handles images, PDFs, Office docs, audio/video, archives, "
+            "text):\n"
             f"{files_listing}\n"
             "The dir is temporary and will be deleted after this turn — "
             "don't reference these paths later.]"
@@ -3303,6 +3689,8 @@ async def run_wakeup_turn(channel, prompt: str) -> None:
 async def token_alert_loop() -> None:
     """DM the operator when a turn or a day's token spend crosses a threshold
     (token_report.check_alerts; each alert fires once)."""
+    if not TOKEN_ALERTS_ENABLED:
+        return
     try:
         alerts = await asyncio.to_thread(token_report.check_alerts)
     except Exception:  # noqa: BLE001
@@ -4153,9 +4541,9 @@ async def on_ready() -> None:
     if not wakeup_loop.is_running():
         wakeup_loop.start()
     log.info("wakeup loop registered (20s tick, self-wakeup sidecar firing)")
-    if not token_alert_loop.is_running():
+    if TOKEN_ALERTS_ENABLED and not token_alert_loop.is_running():
         token_alert_loop.start()
-    log.info("token alert loop registered (120s tick)")
+    log.info("token alert loop %s", "registered (120s tick)" if TOKEN_ALERTS_ENABLED else "disabled")
 
 
 @client.event

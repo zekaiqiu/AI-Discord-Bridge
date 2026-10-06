@@ -45,7 +45,7 @@ if TYPE_CHECKING:  # avoid runtime import of fastapi from a "pure" module
 MAX_FILE_BYTES = 10 * 1024 * 1024
 # Total bytes pending in one session dir across requests (purged at turn end).
 MAX_SESSION_BYTES = 200 * 1024 * 1024
-MAX_FILES_PER_TURN = 5
+MAX_FILES_PER_TURN = 100
 ALLOWED_MIME_PREFIXES: tuple[str, ...] = ("image/", "text/", "audio/", "video/")
 # Document/spreadsheet formats commonly attached in chat. Claude's Read
 # tool handles PDFs natively (vision pass over rendered pages); the

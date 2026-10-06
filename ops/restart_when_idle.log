@@ -1,0 +1,6 @@
+2026-09-30T10:10:31Z waiting for bridge (pid 3948163) to go idle
+2026-09-30T10:11:01Z restarting (idle_streak=4, kids=0)
+2026-10-01T07:49:40Z waiting for bridge (pid 937597) to go idle
+2026-10-01T07:50:10Z restarting (idle_streak=4, kids=0)
+2026-10-01T07:50:18Z post-restart state: active
+Oct 01 07:50:14 main-server python[1700442]: 2026-10-01 07:50:14,071 INFO token alert loop disabled

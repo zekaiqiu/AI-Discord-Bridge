@@ -9,7 +9,9 @@ Provider facts (probed 2026-09-29):
     China host ``api.kimi.com`` serves the same key at the same latency).
   * Model ids ``k3`` (1M context), ``k3-256k`` (same model, 256k context,
     about half the plan quota per call), ``kimi-for-coding``,
-    ``kimi-for-coding-highspeed``.
+    ``kimi-for-coding-highspeed``. All declare text+image(+video) input
+    on /models (probed 2026-10-05): attached images are inlined as
+    image_url parts (SUPPORTS_VISION).
   * ``/models`` declares think efforts low/high/max for k3 (default high).
     Other strings are accepted silently.
   * Cloudflare rejects Python's urllib User-Agent (error 1010); httpx's
@@ -53,6 +55,18 @@ _KIMI_KEY_FILE = Path(os.environ.get(
 _KIMI_MODELS: dict[str, str] = {
     "kimi": os.environ.get("KIMI_MODEL", "k3"),
 }
+
+# /models declares image input for every Kimi Code id and an image turn
+# answers from the picture (probed 2026-10-05). The TokenHub fallback
+# endpoint serves the same model and accepts the same parts (probed:
+# kimi-k3 read a probe PNG's token correctly).
+SUPPORTS_VISION = True
+
+
+def supports_vision(model: str | None) -> bool:
+    """Kimi serves one alias ("kimi" -> k3) and both endpoints it can land
+    on are vision-verified, so any kimi alias is image-capable."""
+    return is_kimi_model(model)
 
 # TokenHub's id for the same model (the fallback endpoint).
 _TOKENHUB_KIMI_MODEL = "kimi-k3"

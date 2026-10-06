@@ -35,6 +35,18 @@ _TOKENHUB_KEY_FILE = Path(os.environ.get(
 _TOKENHUB_MODELS: dict[str, str] = {
     "glm": "glm-5.3",
 }
+
+# Probed 2026-10-05: glm-5.3 400s on any image_url content part
+# ("rejected by an internal MaaS component") — attached images must NOT
+# be inlined for it; they stay reachable via the run_bash preamble +
+# sandbox tooling. (TokenHub's kimi-k3 DOES accept image parts; that
+# path is kimi_runner's fallback, gated on kimi_runner.SUPPORTS_VISION.)
+SUPPORTS_VISION = False
+
+
+def supports_vision(model: str | None) -> bool:
+    """glm-5.3 rejects image_url parts (400) — never inline for it."""
+    return False
 # "kimi" moved to kimi_runner (Kimi Code plan key) on 2026-09-29.
 
 # TokenHub accepts (and serves) larger completions than the haihub default;

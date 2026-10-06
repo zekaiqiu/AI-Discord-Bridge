@@ -53,6 +53,17 @@ _MIMO_MODELS: dict[str, str] = {
     "mimo-flash": "mimo-v2.6-flash",
 }
 
+# Probed 2026-10-05: v2.6 flash/pro accept image_url parts and answer
+# from the picture (both read a probe PNG's token; flash billed explicit
+# image_tokens). The vision note in the system prompt
+# (vision.inline_preamble_note) exists precisely because MiMo otherwise
+# tends to answer "I can't view images" from its text-only prior.
+SUPPORTS_VISION = True
+
+
+def supports_vision(model: str | None) -> bool:
+    return is_mimo_model(model)
+
 # MiMo V2.6 advertises up to 128K output tokens; same ceiling as the
 # TokenHub models — a cap, not a target (see tokenhub_runner).
 _MIMO_MAX_TOKENS = 65536
