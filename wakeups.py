@@ -28,11 +28,13 @@ import os
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import List, Tuple
 
 WAKEUP_DIR = os.environ.get(
     "BRIDGE_WAKEUP_DIR",
-    "/home/felix/Multi-Agent-Framework/claude-bridge/work/wakeups",
+    # <repo>/work/wakeups next to this module — portable across hosts/users.
+    str(Path(__file__).resolve().parent / "work" / "wakeups"),
 )
 
 # Guard rails: a wakeup prompt longer than this is almost certainly a mistake,
